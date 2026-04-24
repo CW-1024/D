@@ -1,0 +1,9 @@
+Package: com.dd.d
+Name: D
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description:折腾
+Maintainer: DD
+Author: DD
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
