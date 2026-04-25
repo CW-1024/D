@@ -408,8 +408,8 @@ static void ShowVCamMenu(void) {
     SEL addBtn = NSSelectorFromString(@"addButtonWithTitle:eventAction:");
     ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, @"选择视频", (__bridge void *)selectVideo);
     ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, [NSString stringWithFormat:@"旋转画面 (%d°)", g_rotation], (__bridge void *)rotate);
-    ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, g_isSoundEnabled ? @"声音：关闭" : @"声音：开启", (__bridge void *)toggleSound);
-    // 修改文字逻辑：g_isLoop 为 YES 显示“开启”，为 NO 显示“关闭”
+    // 修正声音文字：YES 显示“开启”，NO 显示“关闭”
+    ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, g_isSoundEnabled ? @"声音：开启" : @"声音：关闭", (__bridge void *)toggleSound);
     ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, g_isLoop ? @"循环播放：开启" : @"循环播放：关闭", (__bridge void *)toggleLoop);
     ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, @"禁用替换", (__bridge void *)disable);
     ((void (*)(id, SEL, UIView*))objc_msgSend)(sheet, NSSelectorFromString(@"showInView:"), keyWindow);
