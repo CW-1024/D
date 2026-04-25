@@ -9,28 +9,22 @@
 #import <substrate.h>
 
 // ============================================================
-// 全局变量（默认值：循环开启、声音开启、旋转90°）
+// 全局变量
 // ============================================================
 static NSFileManager *g_fileManager = nil;
-static NSString *g_tempFile = nil;                // Documents/bear_vcam_temp.mov
+static NSString *g_tempFile = nil;
 static BOOL g_isPresentingMenu = NO;
+static int g_rotation = 90;
+static BOOL g_isSoundEnabled = YES;
+static BOOL g_isLoop = YES;
 
-static int g_rotation = 90;                       // 默认90度
-static BOOL g_isSoundEnabled = YES;               // 声音默认开启
-static BOOL g_isLoop = YES;                       // 循环播放默认开启
-
-// 麦克风音频格式（动态探测）
 static AudioStreamBasicDescription g_micASBD = {0};
 static BOOL g_hasProbedMicFormat = NO;
-
-// 视频 / 音频读取器（共用锁）
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
 static AVAssetReader *g_audioReader = nil;
 static AVAssetReaderTrackOutput *g_audioOutput = nil;
 static NSLock *g_mediaLock = nil;
-
-// Hook 原始指针
 static OSStatus (*orig_AudioUnitRender)(void *, AudioUnitRenderActionFlags *,
                                         const AudioTimeStamp *, UInt32,
                                         UInt32, AudioBufferList *) = NULL;
@@ -45,7 +39,6 @@ static void SaveSettings(void) {
     [defs setBool:g_isLoop forKey:@"vcam_loop"];
     [defs synchronize];
 }
-
 static void LoadSettings(void) {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
     if ([defs objectForKey:@"vcam_rotation"]) g_rotation = (int)[defs integerForKey:@"vcam_rotation"];
@@ -124,7 +117,7 @@ static void SetupAudioReader(NSString *filePath) {
 }
 
 // ============================================================
-// 获取下一视频帧（循环条件：g_isLoop 为 YES 时循环）
+// 获取下一视频帧
 // ============================================================
 static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
     [g_mediaLock lock];
@@ -146,7 +139,7 @@ static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
 }
 
 // ============================================================
-// 音频数据拉取（循环条件：g_isLoop 为 YES 时循环）
+// 音频数据拉取
 // ============================================================
 static NSData* PullAudioData(NSUInteger needBytes) {
     NSMutableData *data = [NSMutableData dataWithCapacity:needBytes];
@@ -184,12 +177,10 @@ static NSData* PullAudioData(NSUInteger needBytes) {
 }
 
 // ============================================================
-// 将替换帧绘制到目标缓冲区
+// 绘制替换帧
 // ============================================================
 static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     if (!g_fileManager || !g_tempFile || ![g_fileManager fileExistsAtPath:g_tempFile]) return;
-
-    // 热重载检测
     static NSTimeInterval lastLoad = 0;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     NSString *newMark = [g_tempFile stringByAppendingString:@".new"];
@@ -199,15 +190,11 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
         SetupVideoReader(g_tempFile);
         SetupAudioReader(g_tempFile);
     }
-
     CVPixelBufferRef src = GetNextVideoPixelBuffer();
     if (!src) return;
-
     CIImage *srcImage = [CIImage imageWithCVPixelBuffer:src];
     CVPixelBufferRelease(src);
     if (!srcImage) return;
-
-    // 旋转
     CGAffineTransform transform = CGAffineTransformIdentity;
     CGRect extent = srcImage.extent;
     if (g_rotation == 90) {
@@ -221,8 +208,6 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
         transform = CGAffineTransformRotate(transform, 3 * M_PI_2);
     }
     CIImage *rotated = [srcImage imageByApplyingTransform:transform];
-
-    // 缩放至目标尺寸
     size_t targetWidth  = CVPixelBufferGetWidth(targetBuffer);
     size_t targetHeight = CVPixelBufferGetHeight(targetBuffer);
     CGRect rotatedExtent = rotated.extent;
@@ -232,7 +217,6 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     CGFloat offsetX = (targetWidth  - scaledExtent.size.width)  / 2.0;
     CGFloat offsetY = (targetHeight - scaledExtent.size.height) / 2.0;
     CIImage *final = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(offsetX, offsetY)];
-
     static CIContext *ctx = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -249,21 +233,11 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
 @interface VCamProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
-@implementation VCamProxy {
-    __weak id _originalDelegate;
-    dispatch_queue_t _originalQueue;
-}
-- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue {
-    _originalDelegate = delegate;
-    _originalQueue = queue;
-}
-- (void)captureOutput:(AVCaptureOutput *)output
-   didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-          fromConnection:(AVCaptureConnection *)connection {
+@implementation VCamProxy { __weak id _originalDelegate; dispatch_queue_t _originalQueue; }
+- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue { _originalDelegate = delegate; _originalQueue = queue; }
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
     CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (pixelBuffer) {
-        DrawReplacementOntoBuffer(pixelBuffer);
-    }
+    if (pixelBuffer) DrawReplacementOntoBuffer(pixelBuffer);
     if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
         [_originalDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
     }
@@ -282,12 +256,7 @@ static VCamProxy *g_proxy = nil;
 // ============================================================
 // 音频 Hook
 // ============================================================
-static OSStatus hooked_AudioUnitRender(void *inRefCon,
-                                       AudioUnitRenderActionFlags *ioActionFlags,
-                                       const AudioTimeStamp *inTimeStamp,
-                                       UInt32 inBusNumber,
-                                       UInt32 inNumberFrames,
-                                       AudioBufferList *ioData) {
+static OSStatus hooked_AudioUnitRender(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
     if (!g_hasProbedMicFormat) {
         AudioUnit au = (AudioUnit)inRefCon;
         UInt32 size = sizeof(g_micASBD);
@@ -306,13 +275,12 @@ static OSStatus hooked_AudioUnitRender(void *inRefCon,
     if (audioData.length > 0) memcpy(buf->mData, audioData.bytes, MIN(audioData.length, buf->mDataByteSize));
     return ret;
 }
-
 static void InstallAudioHook() {
     MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&orig_AudioUnitRender);
 }
 
 // ============================================================
-// 获取当前 keyWindow（兼容 iOS 18.7）
+// 获取 keyWindow
 // ============================================================
 static UIWindow* GetCurrentKeyWindow(void) {
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -325,7 +293,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
 }
 
 // ============================================================
-// 自定义菜单控制器（带导航栏，左上角取消，右上角确认）
+// 自定义菜单（修复弃用API）
 // ============================================================
 @interface VCamMenuViewController : UIViewController
 @property (nonatomic, copy) void (^selectVideoHandler)(void);
@@ -340,26 +308,21 @@ static UIWindow* GetCurrentKeyWindow(void) {
     UIButton *_soundBtn;
     UIButton *_loopBtn;
 }
-
 - (void)viewDidLoad {
     [super viewDidLoad];
-
-    // 半透明背景
     self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
 
-    // 居中容器
     UIView *container = [[UIView alloc] init];
     container.backgroundColor = [UIColor systemBackgroundColor];
     container.layer.cornerRadius = 16;
     container.layer.masksToBounds = YES;
     container.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:container];
-
     [container.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor].active = YES;
     [container.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor].active = YES;
     [container.widthAnchor constraintEqualToConstant:300].active = YES;
 
-    // 顶部导航栏
+    // 导航栏
     UIView *navBar = [[UIView alloc] init];
     navBar.backgroundColor = [UIColor systemGray6Color];
     navBar.translatesAutoresizingMaskIntoConstraints = NO;
@@ -369,7 +332,6 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [navBar.trailingAnchor constraintEqualToAnchor:container.trailingAnchor].active = YES;
     [navBar.heightAnchor constraintEqualToConstant:44].active = YES;
 
-    // 标题
     UILabel *title = [[UILabel alloc] init];
     title.text = @"VCAM 控制";
     title.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
@@ -379,7 +341,6 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [title.centerXAnchor constraintEqualToAnchor:navBar.centerXAnchor].active = YES;
     [title.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
 
-    // 左侧取消按钮
     UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
     cancelBtn.titleLabel.font = [UIFont systemFontOfSize:18];
@@ -389,7 +350,6 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [cancelBtn.leadingAnchor constraintEqualToAnchor:navBar.leadingAnchor constant:16].active = YES;
     [cancelBtn.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
 
-    // 右侧确认按钮
     UIButton *confirmBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [confirmBtn setTitle:@"确认" forState:UIControlStateNormal];
     confirmBtn.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
@@ -410,14 +370,19 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16].active = YES;
     [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16].active = YES;
 
-    // 通用按钮创建方法
+    // 使用 UIButtonConfiguration 创建按钮（iOS 15+，无废弃警告）
     UIButton* (^createBtn)(NSString *title) = ^UIButton *(NSString *title) {
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        [btn setTitle:title forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
-        btn.backgroundColor = [UIColor systemGray5Color];
+        UIButtonConfiguration *config = [UIButtonConfiguration filledButtonConfiguration];
+        config.title = title;
+        config.baseBackgroundColor = [UIColor systemGray5Color];
+        config.baseForegroundColor = [UIColor labelColor];
+        config.contentInsets = NSDirectionalEdgeInsetsMake(12, 0, 12, 0);
+        UIFont *font = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
+        NSDictionary *attrs = @{NSFontAttributeName: font};
+        NSAttributedString *attrTitle = [[NSAttributedString alloc] initWithString:title attributes:attrs];
+        config.attributedTitle = attrTitle;
+        UIButton *btn = [UIButton buttonWithConfiguration:config primaryAction:nil];
         btn.layer.cornerRadius = 8;
-        btn.contentEdgeInsets = UIEdgeInsetsMake(12, 0, 12, 0);
         return btn;
     };
 
@@ -442,46 +407,24 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [stack addArrangedSubview:disableBtn];
 }
 
-- (void)cancelTapped {
+- (void)cancelTapped  { [self dismiss]; }
+- (void)confirmTapped { [self dismiss]; }
+- (void)dismiss {
     [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
 }
-
-- (void)confirmTapped {
-    [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
-}
-
-- (void)selectVideoTapped {
-    if (self.selectVideoHandler) self.selectVideoHandler();
-}
-
-- (void)rotateTapped {
-    if (self.rotateHandler) self.rotateHandler();
-    [_rotateBtn setTitle:[NSString stringWithFormat:@"旋转画面 (%d°)", g_rotation] forState:UIControlStateNormal];
-}
-
-- (void)soundTapped {
-    if (self.toggleSoundHandler) self.toggleSoundHandler();
-    [_soundBtn setTitle:g_isSoundEnabled ? @"声音：开启" : @"声音：关闭" forState:UIControlStateNormal];
-}
-
-- (void)loopTapped {
-    if (self.toggleLoopHandler) self.toggleLoopHandler();
-    [_loopBtn setTitle:g_isLoop ? @"循环播放：开启" : @"循环播放：关闭" forState:UIControlStateNormal];
-}
-
-- (void)disableTapped {
-    if (self.disableHandler) self.disableHandler();
-}
-
+- (void)selectVideoTapped { if (self.selectVideoHandler) self.selectVideoHandler(); }
+- (void)rotateTapped      { if (self.rotateHandler)      self.rotateHandler();      [_rotateBtn setTitle:[NSString stringWithFormat:@"旋转画面 (%d°)", g_rotation] forState:UIControlStateNormal]; }
+- (void)soundTapped       { if (self.toggleSoundHandler) self.toggleSoundHandler(); [_soundBtn setTitle:g_isSoundEnabled ? @"声音：开启" : @"声音：关闭" forState:UIControlStateNormal]; }
+- (void)loopTapped        { if (self.toggleLoopHandler)  self.toggleLoopHandler();  [_loopBtn setTitle:g_isLoop ? @"循环播放：开启" : @"循环播放：关闭" forState:UIControlStateNormal]; }
+- (void)disableTapped     { if (self.disableHandler)     self.disableHandler(); }
 @end
 
 // ============================================================
-// 显示菜单（自定义控制器，不自动关闭）
+// 显示菜单
 // ============================================================
 static void ShowVCamMenu(void) {
     if (g_isPresentingMenu) return;
     g_isPresentingMenu = YES;
-
     UIWindow *keyWindow = GetCurrentKeyWindow();
     if (!keyWindow) { g_isPresentingMenu = NO; return; }
 
@@ -489,10 +432,8 @@ static void ShowVCamMenu(void) {
     menuVC.modalPresentationStyle = UIModalPresentationOverFullScreen;
     menuVC.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
 
-    // 选择视频回调（现在从菜单控制器 present 相册，保持菜单在下方）
     __weak VCamMenuViewController *weakMenu = menuVC;
     menuVC.selectVideoHandler = ^{
-        // 从菜单 present 相册
         dispatch_async(dispatch_get_main_queue(), ^{
             static id pickerDelegate = nil;
             if (!pickerDelegate) {
@@ -524,11 +465,9 @@ static void ShowVCamMenu(void) {
             [weakMenu presentViewController:picker animated:YES completion:nil];
         });
     };
-
     menuVC.rotateHandler = ^{ g_rotation = (g_rotation + 90) % 360; SaveSettings(); };
     menuVC.toggleSoundHandler = ^{ g_isSoundEnabled = !g_isSoundEnabled; SaveSettings(); };
     menuVC.toggleLoopHandler  = ^{ g_isLoop = !g_isLoop; SaveSettings(); };
-
     menuVC.disableHandler = ^{
         if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
         [g_mediaLock lock];
@@ -543,17 +482,14 @@ static void ShowVCamMenu(void) {
 }
 
 // ============================================================
-// 手势注入（双指双击）
+// 手势注入
 // ============================================================
-@interface UIWindow (VCam)
-- (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap;
-@end
+@interface UIWindow (VCam) - (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap; @end
 @implementation UIWindow (VCam)
 - (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap {
     if (tap.state == UIGestureRecognizerStateRecognized) ShowVCamMenu();
 }
 @end
-
 static void AddGestureToWindow(UIWindow *window) {
     static NSMapTable<UIWindow*, NSNumber*> *map = nil;
     static dispatch_once_t once;
@@ -566,7 +502,6 @@ static void AddGestureToWindow(UIWindow *window) {
     [window addGestureRecognizer:tap];
     [map setObject:@YES forKey:window];
 }
-
 %hook UIWindow
 - (void)makeKeyAndVisible { %orig; dispatch_async(dispatch_get_main_queue(), ^{ AddGestureToWindow(self); }); }
 - (id)initWithFrame:(CGRect)frame { self = %orig; dispatch_async(dispatch_get_main_queue(), ^{ AddGestureToWindow(self); }); return self; }
@@ -585,7 +520,6 @@ static void AddGestureToWindow(UIWindow *window) {
     }
     InstallAudioHook();
 }
-
 %dtor {
     [g_mediaLock lock];
     if (g_videoReader) [g_videoReader cancelReading];
