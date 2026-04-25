@@ -9,17 +9,17 @@
 #import <substrate.h>
 
 // ============================================================
-// 全局变量
+// 全局变量（默认值按需求调整）
 // ============================================================
 static NSFileManager *g_fileManager = nil;
 static NSString *g_tempFile = nil;                // Documents/bear_vcam_temp.mov
 static BOOL g_isPresentingMenu = NO;
 
-static int g_rotation = 0;                        // 旋转角度
-static BOOL g_isSoundEnabled = YES;               // 声音开关
-static BOOL g_isLoop = YES;                       // 循环播放开关（注意：YES 表示关闭循环，NO 表示开启循环）
+static int g_rotation = 90;                       // 默认90度
+static BOOL g_isSoundEnabled = YES;               // 声音默认开启
+static BOOL g_isLoop = NO;                        // 循环播放默认开启（NO 表示循环）
 
-// 麦克风音频格式
+// 麦克风音频格式（动态探测）
 static AudioStreamBasicDescription g_micASBD = {0};
 static BOOL g_hasProbedMicFormat = NO;
 
@@ -34,6 +34,30 @@ static NSLock *g_mediaLock = nil;
 static OSStatus (*orig_AudioUnitRender)(void *, AudioUnitRenderActionFlags *,
                                         const AudioTimeStamp *, UInt32,
                                         UInt32, AudioBufferList *) = NULL;
+
+// ============================================================
+// 持久化工具
+// ============================================================
+static void SaveSettings(void) {
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    [defs setInteger:g_rotation forKey:@"vcam_rotation"];
+    [defs setBool:g_isSoundEnabled forKey:@"vcam_sound"];
+    [defs setBool:g_isLoop forKey:@"vcam_loop"];
+    [defs synchronize];
+}
+
+static void LoadSettings(void) {
+    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+    if ([defs objectForKey:@"vcam_rotation"]) {
+        g_rotation = (int)[defs integerForKey:@"vcam_rotation"];
+    }
+    if ([defs objectForKey:@"vcam_sound"]) {
+        g_isSoundEnabled = [defs boolForKey:@"vcam_sound"];
+    }
+    if ([defs objectForKey:@"vcam_loop"]) {
+        g_isLoop = [defs boolForKey:@"vcam_loop"];
+    }
+}
 
 // ============================================================
 // 沙盒路径
@@ -109,12 +133,11 @@ static void SetupAudioReader(NSString *filePath) {
 }
 
 // ============================================================
-// 获取下一视频帧（修正循环逻辑：!g_isLoop 时重置 reader）
+// 获取下一视频帧（循环条件：!g_isLoop）
 // ============================================================
 static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
     [g_mediaLock lock];
     CMSampleBufferRef sample = [g_videoOutput copyNextSampleBuffer];
-    // 原来的条件 g_isLoop 导致行为反转，现已改为 !g_isLoop，与菜单文字匹配
     if (!sample && !g_isLoop && g_tempFile) {
         [g_mediaLock unlock];
         SetupVideoReader(g_tempFile);
@@ -132,7 +155,7 @@ static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
 }
 
 // ============================================================
-// 音频数据拉取（同样修正循环逻辑）
+// 音频数据拉取（循环条件：!g_isLoop）
 // ============================================================
 static NSData* PullAudioData(NSUInteger needBytes) {
     NSMutableData *data = [NSMutableData dataWithCapacity:needBytes];
@@ -140,13 +163,13 @@ static NSData* PullAudioData(NSUInteger needBytes) {
     while (data.length < needBytes) {
         BOOL shouldReset = NO;
         if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) {
-            if (!g_isLoop && g_tempFile) shouldReset = YES;   // 改为 !g_isLoop
+            if (!g_isLoop && g_tempFile) shouldReset = YES;
             else break;
         }
         CMSampleBufferRef sample = nil;
         if (!shouldReset) {
             sample = [g_audioOutput copyNextSampleBuffer];
-            if (!sample && !g_isLoop && g_tempFile) shouldReset = YES;   // 改为 !g_isLoop
+            if (!sample && !g_isLoop && g_tempFile) shouldReset = YES;
         }
         if (shouldReset) {
             [g_mediaLock unlock];
@@ -170,7 +193,7 @@ static NSData* PullAudioData(NSUInteger needBytes) {
 }
 
 // ============================================================
-// 将替换帧绘制到目标缓冲区（含旋转缩放、热重载）
+// 将替换帧绘制到目标缓冲区
 // ============================================================
 static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     if (!g_fileManager || !g_tempFile || ![g_fileManager fileExistsAtPath:g_tempFile]) return;
@@ -230,7 +253,7 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
 }
 
 // ============================================================
-// 视频代理劫持（直接绘制，零释放风险）
+// 视频代理
 // ============================================================
 @interface VCamProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
@@ -298,7 +321,7 @@ static void InstallAudioHook() {
 }
 
 // ============================================================
-// 窗口与菜单
+// 窗口与菜单（持久化保存设置）
 // ============================================================
 static UIWindow* GetCurrentKeyWindow(void) {
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -353,9 +376,24 @@ static void ShowVCamMenu(void) {
         });
     };
 
-    void (^rotate)(void) = ^{ g_isPresentingMenu = NO; g_rotation = (g_rotation + 90) % 360; };
-    void (^toggleSound)(void) = ^{ g_isPresentingMenu = NO; g_isSoundEnabled = !g_isSoundEnabled; };
-    void (^toggleLoop)(void) = ^{ g_isPresentingMenu = NO; g_isLoop = !g_isLoop; };
+    void (^rotate)(void) = ^{
+        g_isPresentingMenu = NO;
+        g_rotation = (g_rotation + 90) % 360;
+        SaveSettings();
+    };
+
+    void (^toggleSound)(void) = ^{
+        g_isPresentingMenu = NO;
+        g_isSoundEnabled = !g_isSoundEnabled;
+        SaveSettings();
+    };
+
+    void (^toggleLoop)(void) = ^{
+        g_isPresentingMenu = NO;
+        g_isLoop = !g_isLoop;
+        SaveSettings();
+    };
+
     void (^disable)(void) = ^{
         g_isPresentingMenu = NO;
         if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
@@ -406,11 +444,13 @@ static void AddGestureToWindow(UIWindow *window) {
 %end
 
 // ============================================================
-// 构造 & 析构
+// 构造 & 析构（加载持久化设置）
 // ============================================================
 %ctor {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock = [[NSLock alloc] init];
+    // 加载之前保存的设置（如果存在）
+    LoadSettings();
     g_tempFile = [[GetDocumentPath() stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
     if ([g_fileManager fileExistsAtPath:g_tempFile]) {
         SetupVideoReader(g_tempFile);
