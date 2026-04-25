@@ -44,7 +44,7 @@ static NSString* GetCachesPath(void) {
 }
 
 // ============================================================
-// 视频读取器设置 (原版 setupVideoReaderIfNeeded)
+// 视频读取器设置
 // ============================================================
 static void SetupVideoReader(NSString *filePath) {
     [g_mediaLock lock];
@@ -81,7 +81,7 @@ static void SetupVideoReader(NSString *filePath) {
 }
 
 // ============================================================
-// 音频读取器设置 (原版 setupAudioReaderIfNeeded)
+// 音频读取器设置
 // ============================================================
 static void SetupAudioReader(NSString *filePath) {
     [g_mediaLock lock];
@@ -118,13 +118,12 @@ static void SetupAudioReader(NSString *filePath) {
 }
 
 // ============================================================
-// 视频帧获取 (原版 getVideoFrame:)
+// 视频帧获取
 // ============================================================
 static CMSampleBufferRef GetNextVideoSampleBuffer(void) {
     [g_mediaLock lock];
     CMSampleBufferRef sample = [g_videoOutput copyNextSampleBuffer];
     if (!sample) {
-        // 循环播放
         if (g_tempFile) {
             SetupVideoReader(g_tempFile);
             sample = [g_videoOutput copyNextSampleBuffer];
@@ -135,7 +134,7 @@ static CMSampleBufferRef GetNextVideoSampleBuffer(void) {
 }
 
 // ============================================================
-// 音频数据拉取 (原版 pullAudioData:length:)
+// 音频数据拉取
 // ============================================================
 static NSData* PullAudioData(NSUInteger needBytes) {
     NSMutableData *resultData = [NSMutableData dataWithCapacity:needBytes];
@@ -173,7 +172,7 @@ static NSData* PullAudioData(NSUInteger needBytes) {
 }
 
 // ============================================================
-// 画面旋转处理 (原版 g_rotation 逻辑)
+// 画面旋转处理
 // ============================================================
 static CVPixelBufferRef RotatePixelBuffer(CVPixelBufferRef src, int degrees) {
     if (degrees == 0 || !src) return src;
@@ -213,7 +212,7 @@ static CVPixelBufferRef RotatePixelBuffer(CVPixelBufferRef src, int degrees) {
 }
 
 // ============================================================
-// 视频代理劫持 (原版: 自己作为代理, 构建新的 CMSampleBuffer)
+// 视频代理劫持
 // ============================================================
 @interface VCamProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
@@ -232,7 +231,7 @@ static CVPixelBufferRef RotatePixelBuffer(CVPixelBufferRef src, int degrees) {
           fromConnection:(AVCaptureConnection *)connection {
     CMSampleBufferRef replacementBuffer = GetNextVideoSampleBuffer();
     if (replacementBuffer) {
-        CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+        // 获取原始时间戳
         CMSampleTimingInfo timingInfo;
         CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timingInfo);
 
@@ -268,7 +267,6 @@ static CVPixelBufferRef RotatePixelBuffer(CVPixelBufferRef src, int degrees) {
         });
     }
     if (sampleBuffer != replacementBuffer) {
-        // 如果创建了新缓冲，释放它
         CFRelease(sampleBuffer);
     }
 }
@@ -285,7 +283,7 @@ static VCamProxy *g_proxy = nil;
 %end
 
 // ============================================================
-// 音频 Hook (原版 AudioUnitRender)
+// 音频 Hook
 // ============================================================
 static OSStatus hooked_AudioUnitRender(void *inRefCon,
                                        AudioUnitRenderActionFlags *ioActionFlags,
@@ -312,27 +310,34 @@ static void InstallAudioHook() {
 }
 
 // ============================================================
-// 菜单 (WCActionSheet, 原版功能)
+// 辅助函数：获取当前 key window（兼容多场景）
+// ============================================================
+static UIWindow* GetCurrentKeyWindow(void) {
+    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *w in scene.windows) {
+                if (w.isKeyWindow) return w;
+            }
+            return scene.windows.firstObject;
+        }
+    }
+    return nil;
+}
+
+// ============================================================
+// 菜单 (WCActionSheet)
 // ============================================================
 static void ShowVCamMenu(void) {
     if (g_isPresentingMenu) return;
     g_isPresentingMenu = YES;
 
-    UIWindow *keyWindow = nil;
-    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in scene.windows) {
-                if (w.isKeyWindow) { keyWindow = w; break; }
-            }
-            if (!keyWindow) keyWindow = scene.windows.firstObject;
-        }
-    }
+    UIWindow *keyWindow = GetCurrentKeyWindow();
     if (!keyWindow) { g_isPresentingMenu = NO; return; }
 
     void (^selectVideoAction)(void) = ^{
         g_isPresentingMenu = NO;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UIWindow *win = [UIApplication sharedApplication].keyWindow;
+            UIWindow *win = GetCurrentKeyWindow();
             UIViewController *rootVC = win.rootViewController;
             while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
 
