@@ -9,7 +9,7 @@
 #import <substrate.h>
 
 // ============================================================
-// 全局变量（默认值按需求调整）
+// 全局变量（默认值：循环开启、声音开启、旋转90°）
 // ============================================================
 static NSFileManager *g_fileManager = nil;
 static NSString *g_tempFile = nil;                // Documents/bear_vcam_temp.mov
@@ -17,7 +17,7 @@ static BOOL g_isPresentingMenu = NO;
 
 static int g_rotation = 90;                       // 默认90度
 static BOOL g_isSoundEnabled = YES;               // 声音默认开启
-static BOOL g_isLoop = NO;                        // 循环播放默认开启（NO 表示循环）
+static BOOL g_isLoop = YES;                       // 循环播放默认开启（YES表示循环）
 
 // 麦克风音频格式（动态探测）
 static AudioStreamBasicDescription g_micASBD = {0};
@@ -133,12 +133,12 @@ static void SetupAudioReader(NSString *filePath) {
 }
 
 // ============================================================
-// 获取下一视频帧（循环条件：!g_isLoop）
+// 获取下一视频帧（循环条件：g_isLoop 为 YES 时循环）
 // ============================================================
 static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
     [g_mediaLock lock];
     CMSampleBufferRef sample = [g_videoOutput copyNextSampleBuffer];
-    if (!sample && !g_isLoop && g_tempFile) {
+    if (!sample && g_isLoop && g_tempFile) {
         [g_mediaLock unlock];
         SetupVideoReader(g_tempFile);
         [g_mediaLock lock];
@@ -155,7 +155,7 @@ static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
 }
 
 // ============================================================
-// 音频数据拉取（循环条件：!g_isLoop）
+// 音频数据拉取（循环条件：g_isLoop 为 YES 时循环）
 // ============================================================
 static NSData* PullAudioData(NSUInteger needBytes) {
     NSMutableData *data = [NSMutableData dataWithCapacity:needBytes];
@@ -163,13 +163,13 @@ static NSData* PullAudioData(NSUInteger needBytes) {
     while (data.length < needBytes) {
         BOOL shouldReset = NO;
         if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) {
-            if (!g_isLoop && g_tempFile) shouldReset = YES;
+            if (g_isLoop && g_tempFile) shouldReset = YES;
             else break;
         }
         CMSampleBufferRef sample = nil;
         if (!shouldReset) {
             sample = [g_audioOutput copyNextSampleBuffer];
-            if (!sample && !g_isLoop && g_tempFile) shouldReset = YES;
+            if (!sample && g_isLoop && g_tempFile) shouldReset = YES;
         }
         if (shouldReset) {
             [g_mediaLock unlock];
@@ -409,7 +409,8 @@ static void ShowVCamMenu(void) {
     ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, @"选择视频", (__bridge void *)selectVideo);
     ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, [NSString stringWithFormat:@"旋转画面 (%d°)", g_rotation], (__bridge void *)rotate);
     ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, g_isSoundEnabled ? @"声音：关闭" : @"声音：开启", (__bridge void *)toggleSound);
-    ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, g_isLoop ? @"循环播放：关闭" : @"循环播放：开启", (__bridge void *)toggleLoop);
+    // 修改文字逻辑：g_isLoop 为 YES 显示“开启”，为 NO 显示“关闭”
+    ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, g_isLoop ? @"循环播放：开启" : @"循环播放：关闭", (__bridge void *)toggleLoop);
     ((void (*)(id, SEL, NSString*, void*))objc_msgSend)(sheet, addBtn, @"禁用替换", (__bridge void *)disable);
     ((void (*)(id, SEL, UIView*))objc_msgSend)(sheet, NSSelectorFromString(@"showInView:"), keyWindow);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ g_isPresentingMenu = NO; });
@@ -449,7 +450,7 @@ static void AddGestureToWindow(UIWindow *window) {
 %ctor {
     g_fileManager = [NSFileManager defaultManager];
     g_mediaLock = [[NSLock alloc] init];
-    // 加载之前保存的设置（如果存在）
+    // 加载之前保存的设置（如果存在），否则使用默认值（循环开启、声音开启、90度）
     LoadSettings();
     g_tempFile = [[GetDocumentPath() stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
     if ([g_fileManager fileExistsAtPath:g_tempFile]) {
