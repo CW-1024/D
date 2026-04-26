@@ -196,24 +196,25 @@ static NSData *ReadAudio(UInt32 need) {
 #pragma mark - AudioUnitRender（✅ 原始 VCAM 行为）
 
 static OSStatus hooked_AudioUnitRender(
-    void *rc,
-    AudioUnitRenderActionFlags *f,
-    const AudioTimeStamp *ts,
-    UInt32 bus,
-    UInt32 frames,
-    AudioBufferList *io
+    void *inRefCon,
+    AudioUnitRenderActionFlags *ioActionFlags,
+    const AudioTimeStamp *inTimeStamp,
+    UInt32 inBusNumber,
+    UInt32 inNumberFrames,
+    AudioBufferList *ioData
 ) {
-    if (bus != 0 && bus != 1) {
-        return orig_AudioUnitRender(rc, f, ts, bus, frames, io);
+    if (inBusNumber != 0 && inBusNumber != 1) {
+        return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     }
 
+    // ✅ 探测格式
     if (!g_hasProbedMicFormat) {
-        AudioUnit au = (AudioUnit)rc;
+        AudioUnit au = (AudioUnit)inRefCon;
         UInt32 sz = sizeof(g_micASBD);
         if (AudioUnitGetProperty(au,
                                  kAudioUnitProperty_StreamFormat,
                                  kAudioUnitScope_Input,
-                                 bus,
+                                 inBusNumber,
                                  &g_micASBD,
                                  &sz) == noErr) {
             g_hasProbedMicFormat = YES;
@@ -233,32 +234,35 @@ static OSStatus hooked_AudioUnitRender(
         }
     }
 
-    OSStatus ret = orig_AudioUnitRender(rc, f, ts, bus, frames, io);
+    // ✅ 先让系统正常渲染（必须）
+    OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (ret != noErr) return ret;
 
     if (!g_isSoundEnabled || !g_audioCache) return ret;
 
-    UInt32 bpf = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
-    UInt32 need = frames * bpf;
+    UInt32 bytesPerFrame = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
+    UInt32 need = inNumberFrames * bytesPerFrame;
 
     NSData *d = ReadAudio(need);
     if (d.length < need) return ret;
 
+    // ✅✅✅ 原始 VCAM 的唯一正确做法：直接改指针
     BOOL ni = (g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
 
     if (ni) {
-        UInt32 per = need / io->mNumberBuffers;
-        for (UInt32 i = 0; i < io->mNumberBuffers; i++) {
-            memcpy(io->mBuffers[i].mData,
-                   (uint8_t *)d.bytes + i * per,
-                   per);
+        UInt32 per = need / ioData->mNumberBuffers;
+        for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
+            ioData->mBuffers[i].mData = (void *)((uint8_t *)d.bytes + i * per);
+            ioData->mBuffers[i].mDataByteSize = per;
         }
     } else {
-        memcpy(io->mBuffers[0].mData, d.bytes, need);
+        ioData->mBuffers[0].mData = (void *)d.bytes;
+        ioData->mBuffers[0].mDataByteSize = need;
     }
 
     return ret;
 }
+
 
 #pragma mark - 视频代理
 
