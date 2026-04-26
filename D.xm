@@ -89,7 +89,7 @@ static void SetupVideoReader(NSString *filePath) {
     [g_mediaLock unlock];
 }
 
-#pragma mark - 音频读取器（✅ 修复）
+#pragma mark - 音频读取器
 
 static void SetupAudioReader(NSString *filePath) {
     [g_mediaLock lock];
@@ -170,7 +170,8 @@ static NSData* PullAudioData(UInt32 needBytes) {
         size_t totalSize = 0;
         CMBlockBufferGetDataPointer(block, 0, NULL, &totalSize, NULL);
         if (totalSize > 0) {
-            uint8_t *ptr = malloc(totalSize);
+            // ✅ 修复：强制类型转换
+            uint8_t *ptr = (uint8_t *)malloc(totalSize);
             CMBlockBufferCopyDataBytes(block, 0, totalSize, ptr);
             [data appendBytes:ptr length:totalSize];
             free(ptr);
@@ -236,7 +237,7 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     CVPixelBufferUnlockBaseAddress(targetBuffer, 0);
 }
 
-#pragma mark - AudioUnitRender（✅ 核心修复）
+#pragma mark - AudioUnitRender（对齐原始 VCAM）
 
 static OSStatus hooked_AudioUnitRender(
     void *inRefCon,
