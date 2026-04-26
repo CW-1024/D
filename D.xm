@@ -341,7 +341,7 @@ static VCamVideoProxy *g_videoProxy = nil;
 }
 %end
 
-#pragma mark - 悬浮菜单（完整保留）
+#pragma mark - 悬浮菜单（原样保留）
 
 static UIWindow* GetCurrentKeyWindow(void) {
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
