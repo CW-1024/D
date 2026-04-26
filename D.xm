@@ -12,31 +12,31 @@
 // 全局变量（默认值：循环开启、声音开启、旋转90°）
 // ============================================================
 static NSFileManager *g_fileManager = nil;
-static NSString *g_tempFile = nil;                // 视频文件路径（Documents/bear_vcam_temp.mov）
-static BOOL g_isPresentingMenu = NO;              // 菜单是否正在显示
+static NSString *g_tempFile = nil;                // 视频文件路径
+static BOOL g_isPresentingMenu = NO;
 
 static int g_rotation = 90;                       // 旋转角度，默认90度
 static BOOL g_isSoundEnabled = YES;               // 声音开关，默认开启
 static BOOL g_isLoop = YES;                       // 循环播放，默认开启
 
-// 麦克风音频格式（动态探测）
+// 动态探测的麦克风音频格式
 static AudioStreamBasicDescription g_micASBD = {0};
 static BOOL g_hasProbedMicFormat = NO;
 
-// 视频 / 音频读取器（共用锁，与原版 g_mediaLock 一致）
+// 视频/音频读取器（共用锁，与原版 g_mediaLock 一致）
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
 static AVAssetReader *g_audioReader = nil;
 static AVAssetReaderTrackOutput *g_audioOutput = nil;
 static NSLock *g_mediaLock = nil;
 
-// Hook 原始指针
+// Hook 原始函数指针
 static OSStatus (*orig_AudioUnitRender)(void *, AudioUnitRenderActionFlags *,
                                         const AudioTimeStamp *, UInt32,
                                         UInt32, AudioBufferList *) = NULL;
 
 // ============================================================
-// 持久化工具：保存和读取设置到 NSUserDefaults
+// 持久化（保存/读取设置到 NSUserDefaults）
 // ============================================================
 static void SaveSettings(void) {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
@@ -53,7 +53,7 @@ static void LoadSettings(void) {
 }
 
 // ============================================================
-// 沙盒路径（原版使用 Documents/bear_vcam_temp.mov）
+// 沙盒路径（原版 Documents/bear_vcam_temp.mov）
 // ============================================================
 static NSString* GetDocumentPath(void) {
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -89,7 +89,7 @@ static void SetupVideoReader(NSString *filePath) {
 }
 
 // ============================================================
-// 音频读取器设置（完全对齐原版，添加 AVLinearPCMIsNonInterleaved）
+// 音频读取器设置（完全对齐原版，格式严格匹配麦克风）
 // ============================================================
 static void SetupAudioReader(NSString *filePath) {
     [g_mediaLock lock];
@@ -107,13 +107,13 @@ static void SetupAudioReader(NSString *filePath) {
     if (audioTracks.count == 0) { [g_mediaLock unlock]; return; }
     AVAssetTrack *track = audioTracks[0];
     AudioStreamBasicDescription asbd = g_micASBD;
-    // 修复：添加 AVLinearPCMIsNonInterleaved 键，确保格式严格匹配
+    // 对齐原版：使用探测到的所有格式参数，包含交错/非交错标志
     NSDictionary *settings = @{
         AVFormatIDKey            : @(kAudioFormatLinearPCM),
         AVLinearPCMBitDepthKey   : @(asbd.mBitsPerChannel),
         AVLinearPCMIsFloatKey    : @((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0),
         AVLinearPCMIsBigEndianKey: @((asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0),
-        AVLinearPCMIsNonInterleaved: @((asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0), // 对齐原版
+        AVLinearPCMIsNonInterleaved: @((asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0),
         AVNumberOfChannelsKey    : @(asbd.mChannelsPerFrame),
         AVSampleRateKey          : @(asbd.mSampleRate)
     };
@@ -147,7 +147,7 @@ static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
 }
 
 // ============================================================
-// 音频数据拉取（修复循环退出逻辑，防止死循环）
+// 音频数据拉取（对齐原版，防死循环，自动循环）
 // ============================================================
 static NSData* PullAudioData(NSUInteger needBytes) {
     NSMutableData *data = [NSMutableData dataWithCapacity:needBytes];
@@ -156,7 +156,7 @@ static NSData* PullAudioData(NSUInteger needBytes) {
         BOOL shouldReset = NO;
         if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) {
             if (g_isLoop && g_tempFile) shouldReset = YES;
-            else break; // 非循环模式或无文件，退出
+            else break;                     // 非循环或不可恢复，退出
         }
         CMSampleBufferRef sample = nil;
         if (!shouldReset) {
@@ -167,7 +167,7 @@ static NSData* PullAudioData(NSUInteger needBytes) {
             [g_mediaLock unlock];
             SetupAudioReader(g_tempFile);
             [g_mediaLock lock];
-            // 重置后检查 reader 是否真的可用，否则退出避免死循环
+            // 重置后再次检查 reader 是否真的可用
             if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) {
                 break;
             }
@@ -194,7 +194,7 @@ static NSData* PullAudioData(NSUInteger needBytes) {
 static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     if (!g_fileManager || !g_tempFile || ![g_fileManager fileExistsAtPath:g_tempFile]) return;
 
-    // 热重载检测：如果存在 .new 文件，则重新加载视频和音频
+    // 热重载检测
     static NSTimeInterval lastLoad = 0;
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     NSString *newMark = [g_tempFile stringByAppendingString:@".new"];
@@ -285,7 +285,7 @@ static VCamProxy *g_proxy = nil;
 %end
 
 // ============================================================
-// 音频 Hook（修复：增加总线过滤，确保格式化匹配）
+// 音频 Hook（移除总线过滤，完全对齐原版）
 // ============================================================
 static OSStatus hooked_AudioUnitRender(void *inRefCon,
                                        AudioUnitRenderActionFlags *ioActionFlags,
@@ -293,25 +293,27 @@ static OSStatus hooked_AudioUnitRender(void *inRefCon,
                                        UInt32 inBusNumber,
                                        UInt32 inNumberFrames,
                                        AudioBufferList *ioData) {
-    // 只在麦克风输入总线（通常为1）上进行替换，避免影响其他音频
-    if (inBusNumber != 1) {
-        return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
-    }
-
-    // 初次探测麦克风格式
+    // 初次探测麦克风输入格式（仍使用 bus 1 作为常见麦克风总线）
     if (!g_hasProbedMicFormat) {
         AudioUnit au = (AudioUnit)inRefCon;
         UInt32 size = sizeof(g_micASBD);
         if (AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &g_micASBD, &size) == noErr) {
             g_hasProbedMicFormat = YES;
-            if (g_tempFile && [g_fileManager fileExistsAtPath:g_tempFile]) SetupAudioReader(g_tempFile);
+            if (g_tempFile && [g_fileManager fileExistsAtPath:g_tempFile]) {
+                SetupAudioReader(g_tempFile);
+            }
         }
     }
 
+    // 调用原始函数，无论是否替换，都需要先获取原始数据（保证缓冲区有效）
     OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
-    // 声音关闭时不替换，保留原声
-    if (!g_isSoundEnabled || !ioData || ioData->mNumberBuffers == 0) return ret;
+    
+    // 声音关闭则不覆盖，保留原声；无输出缓冲区也直接返回
+    if (!g_isSoundEnabled || !ioData || ioData->mNumberBuffers == 0) {
+        return ret;
+    }
 
+    // 计算需要覆盖的字节数
     AudioBuffer *buf = &ioData->mBuffers[0];
     NSUInteger sampleSize = g_micASBD.mBitsPerChannel / 8;
     NSUInteger channels = g_micASBD.mChannelsPerFrame;
@@ -341,7 +343,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
 }
 
 // ============================================================
-// 自定义菜单控制器（带确认/取消逻辑）
+// 自定义菜单（确认/取消逻辑）
 // ============================================================
 @interface VCamMenuViewController : UIViewController
 @end
@@ -350,10 +352,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
     int _tempRotation;
     BOOL _tempSound;
     BOOL _tempLoop;
-
-    UIButton *_rotateBtn;
-    UIButton *_soundBtn;
-    UIButton *_loopBtn;
+    UIButton *_rotateBtn, *_soundBtn, *_loopBtn;
 }
 
 - (instancetype)init {
@@ -379,7 +378,6 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [container.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor].active = YES;
     [container.widthAnchor constraintEqualToConstant:300].active = YES;
 
-    // 导航栏
     UIView *navBar = [[UIView alloc] init];
     navBar.backgroundColor = [UIColor systemGray6Color];
     navBar.translatesAutoresizingMaskIntoConstraints = NO;
@@ -416,7 +414,6 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [confirmBtn.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
     [confirmBtn.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
 
-    // 功能按钮
     UIStackView *stack = [[UIStackView alloc] init];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.spacing = 8;
@@ -427,7 +424,6 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16].active = YES;
     [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16].active = YES;
 
-    // 按钮创建工具（iOS 15+ UIButtonConfiguration）
     UIButton* (^createBtn)(NSString *title) = ^UIButton *(NSString *title) {
         UIButtonConfiguration *config = [UIButtonConfiguration filledButtonConfiguration];
         config.baseBackgroundColor = [UIColor systemGray5Color];
@@ -462,18 +458,9 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [stack addArrangedSubview:disableBtn];
 }
 
-- (void)rotatePreview:(UIButton *)btn {
-    _tempRotation = (_tempRotation + 90) % 360;
-    [_rotateBtn setTitle:[NSString stringWithFormat:@"旋转画面 (%d°)", _tempRotation] forState:UIControlStateNormal];
-}
-- (void)soundPreview:(UIButton *)btn {
-    _tempSound = !_tempSound;
-    [_soundBtn setTitle:_tempSound ? @"声音：开启" : @"声音：关闭" forState:UIControlStateNormal];
-}
-- (void)loopPreview:(UIButton *)btn {
-    _tempLoop = !_tempLoop;
-    [_loopBtn setTitle:_tempLoop ? @"循环播放：开启" : @"循环播放：关闭" forState:UIControlStateNormal];
-}
+- (void)rotatePreview:(UIButton *)btn { _tempRotation = (_tempRotation + 90) % 360; [ _rotateBtn setTitle:[NSString stringWithFormat:@"旋转画面 (%d°)", _tempRotation] forState:UIControlStateNormal]; }
+- (void)soundPreview:(UIButton *)btn  { _tempSound = !_tempSound; [ _soundBtn setTitle:_tempSound ? @"声音：开启" : @"声音：关闭" forState:UIControlStateNormal]; }
+- (void)loopPreview:(UIButton *)btn   { _tempLoop = !_tempLoop; [ _loopBtn setTitle:_tempLoop ? @"循环播放：开启" : @"循环播放：关闭" forState:UIControlStateNormal]; }
 
 - (void)confirmAndDismiss {
     g_rotation = _tempRotation;
@@ -530,23 +517,16 @@ static UIWindow* GetCurrentKeyWindow(void) {
     }
     [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
 }
-
 @end
 
-// ============================================================
-// 显示菜单
-// ============================================================
 static void ShowVCamMenu(void) {
     if (g_isPresentingMenu) return;
     g_isPresentingMenu = YES;
-
     UIWindow *keyWindow = GetCurrentKeyWindow();
     if (!keyWindow) { g_isPresentingMenu = NO; return; }
-
     VCamMenuViewController *menuVC = [[VCamMenuViewController alloc] init];
     menuVC.modalPresentationStyle = UIModalPresentationOverFullScreen;
     menuVC.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
-
     UIViewController *rootVC = keyWindow.rootViewController;
     while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
     [rootVC presentViewController:menuVC animated:YES completion:nil];
@@ -555,9 +535,7 @@ static void ShowVCamMenu(void) {
 // ============================================================
 // 手势注入（双指双击）
 // ============================================================
-@interface UIWindow (VCam)
-- (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap;
-@end
+@interface UIWindow (VCam) - (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap; @end
 @implementation UIWindow (VCam)
 - (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap {
     if (tap.state == UIGestureRecognizerStateRecognized) ShowVCamMenu();
