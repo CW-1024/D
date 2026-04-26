@@ -21,11 +21,11 @@ static BOOL g_hasProbedMicFormat = NO;
 
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
-static NSLock *g_mediaLock = nil;
 
-// ✅ 原始文件：音频数据缓存
 static NSMutableData *g_audioCache = nil;
-static NSUInteger g_audioCacheOffset = 0;
+static NSUInteger g_audioOffset = 0;
+
+static NSLock *g_lock = nil;
 
 static OSStatus (*orig_AudioUnitRender)(
     void *,
@@ -36,7 +36,7 @@ static OSStatus (*orig_AudioUnitRender)(
     AudioBufferList *
 ) = NULL;
 
-#pragma mark - 辅助函数
+#pragma mark - 设置
 
 static void SaveSettings(void) {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
@@ -53,245 +53,174 @@ static void LoadSettings(void) {
     if ([defs objectForKey:@"vcam_loop"])    g_isLoop = [defs boolForKey:@"vcam_loop"];
 }
 
-static NSString* GetDocumentPath(void) {
-    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+static NSString* DocPath(void) {
+    return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 }
 
-#pragma mark - ✅ 视频读取器（必须在前面定义）
+#pragma mark - 视频读取
 
-static void SetupVideoReader(NSString *filePath) {
-    [g_mediaLock lock];
+static void SetupVideo(NSString *path) {
+    [g_lock lock];
     if (g_videoReader) {
         [g_videoReader cancelReading];
         g_videoReader = nil;
         g_videoOutput = nil;
     }
-    if (![g_fileManager fileExistsAtPath:filePath]) {
-        [g_mediaLock unlock];
+    if (![g_fileManager fileExistsAtPath:path]) {
+        [g_lock unlock];
         return;
     }
-    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:filePath]];
-    NSError *error = nil;
-    g_videoReader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
-    if (error || !g_videoReader) {
-        [g_mediaLock unlock];
+    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
+    AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+    if (!track) {
+        [g_lock unlock];
         return;
     }
-    NSArray *videoTracks = [asset tracksWithMediaType:AVMediaTypeVideo];
-    if (videoTracks.count == 0) {
-        [g_mediaLock unlock];
+    NSError *err = nil;
+    g_videoReader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+    if (err) {
+        [g_lock unlock];
         return;
     }
-    AVAssetTrack *videoTrack = videoTracks[0];
-    NSDictionary *settings = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
-    g_videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:settings];
+    g_videoOutput = [[AVAssetReaderTrackOutput alloc]
+        initWithTrack:track
+        outputSettings:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}];
     g_videoOutput.alwaysCopiesSampleData = NO;
     [g_videoReader addOutput:g_videoOutput];
     [g_videoReader startReading];
-    [g_mediaLock unlock];
+    [g_lock unlock];
 }
 
-static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
-    [g_mediaLock lock];
-    CMSampleBufferRef sample = [g_videoOutput copyNextSampleBuffer];
-    if (!sample && g_isLoop && g_tempFile) {
-        [g_mediaLock unlock];
-        SetupVideoReader(g_tempFile);
-        [g_mediaLock lock];
-        sample = [g_videoOutput copyNextSampleBuffer];
+static CVPixelBufferRef ReadVideoFrame(void) {
+    [g_lock lock];
+    CMSampleBufferRef s = [g_videoOutput copyNextSampleBuffer];
+    if (!s && g_isLoop && g_tempFile) {
+        [g_lock unlock];
+        SetupVideo(g_tempFile);
+        [g_lock lock];
+        s = [g_videoOutput copyNextSampleBuffer];
     }
-    CVPixelBufferRef pixel = NULL;
-    if (sample) {
-        pixel = CMSampleBufferGetImageBuffer(sample);
-        if (pixel) CVPixelBufferRetain(pixel);
-        CFRelease(sample);
-    }
-    [g_mediaLock unlock];
-    return pixel;
+    CVPixelBufferRef p = s ? CMSampleBufferGetImageBuffer(s) : NULL;
+    if (p) CVPixelBufferRetain(p);
+    if (s) CFRelease(s);
+    [g_lock unlock];
+    return p;
 }
 
-#pragma mark - ✅ 原始文件：音频数据处理
+#pragma mark - ✅ 原始 VCAM 音频处理
 
-static void LoadAudioFromFile(NSString *filePath) {
-    [g_mediaLock lock];
+static void LoadAudio(NSString *path, AudioStreamBasicDescription asbd) {
+    [g_lock lock];
     g_audioCache = nil;
-    g_audioCacheOffset = 0;
-    
-    if (![g_fileManager fileExistsAtPath:filePath]) {
-        [g_mediaLock unlock];
+    g_audioOffset = 0;
+
+    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:path]];
+    AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+    if (!track) {
+        [g_lock unlock];
         return;
     }
-    
-    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:filePath]];
-    NSArray *audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
-    if (audioTracks.count == 0) {
-        [g_mediaLock unlock];
+
+    NSError *err = nil;
+    AVAssetReader *r = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+    if (err) {
+        [g_lock unlock];
         return;
     }
-    
-    AVAssetTrack *track = audioTracks[0];
-    
-    NSError *error = nil;
-    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
-    if (error || !reader) {
-        [g_mediaLock unlock];
-        return;
-    }
-    
-    NSDictionary *settings = @{
+
+    NSDictionary *cfg = @{
         AVFormatIDKey: @(kAudioFormatLinearPCM),
-        AVLinearPCMBitDepthKey: @16,
-        AVLinearPCMIsFloatKey: @NO,
-        AVLinearPCMIsBigEndianKey: @NO,
-        AVLinearPCMIsNonInterleaved: @NO,
-        AVNumberOfChannelsKey: @2,
-        AVSampleRateKey: @44100.0
+        AVSampleRateKey: @(asbd.mSampleRate),
+        AVNumberOfChannelsKey: @(asbd.mChannelsPerFrame),
+        AVLinearPCMBitDepthKey: @(asbd.mBitsPerChannel),
+        AVLinearPCMIsFloatKey: @((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0),
+        AVLinearPCMIsBigEndianKey: @((asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0),
+        AVLinearPCMIsNonInterleaved: @((asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0)
     };
-    
-    AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
-    [reader addOutput:output];
-    [reader startReading];
-    
-    NSMutableData *audioData = [NSMutableData data];
-    while (reader.status == AVAssetReaderStatusReading) {
-        CMSampleBufferRef sampleBuffer = [output copyNextSampleBuffer];
-        if (!sampleBuffer) break;
-        
-        CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
-        size_t length = 0;
-        CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &length, NULL);
-        
-        if (length > 0) {
-            uint8_t *data = (uint8_t *)malloc(length);
-            CMBlockBufferCopyDataBytes(blockBuffer, 0, length, data);
-            [audioData appendBytes:data length:length];
-            free(data);
+
+    AVAssetReaderTrackOutput *out = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:cfg];
+    [r addOutput:out];
+    [r startReading];
+
+    NSMutableData *data = [NSMutableData data];
+    while (r.status == AVAssetReaderStatusReading) {
+        CMSampleBufferRef s = [out copyNextSampleBuffer];
+        if (!s) break;
+        CMBlockBufferRef b = CMSampleBufferGetDataBuffer(s);
+        size_t len = 0;
+        CMBlockBufferGetDataPointer(b, 0, NULL, &len, NULL);
+        if (len > 0) {
+            uint8_t *p = (uint8_t *)malloc(len);
+            CMBlockBufferCopyDataBytes(b, 0, len, p);
+            [data appendBytes:p length:len];
+            free(p);
         }
-        CFRelease(sampleBuffer);
+        CFRelease(s);
     }
-    
-    if (reader.status == AVAssetReaderStatusCompleted) {
-        g_audioCache = audioData;
+
+    if (r.status == AVAssetReaderStatusCompleted) {
+        g_audioCache = data;
     }
-    
-    [g_mediaLock unlock];
+
+    [g_lock unlock];
 }
 
-static NSData* GetAudioData(NSUInteger needBytes) {
-    [g_mediaLock lock];
-    
+static NSData *ReadAudio(UInt32 need) {
+    [g_lock lock];
     if (!g_audioCache || g_audioCache.length == 0) {
-        [g_mediaLock unlock];
-        return [NSMutableData dataWithLength:needBytes];
+        [g_lock unlock];
+        return [NSMutableData dataWithLength:need];
     }
-    
-    NSMutableData *data = [NSMutableData dataWithCapacity:needBytes];
-    
-    while (data.length < needBytes) {
-        if (g_audioCacheOffset >= g_audioCache.length) {
-            if (g_isLoop) {
-                g_audioCacheOffset = 0;
-            } else {
-                break;
-            }
+
+    NSMutableData *d = [NSMutableData data];
+    while (d.length < need) {
+        if (g_audioOffset >= g_audioCache.length) {
+            if (g_isLoop) g_audioOffset = 0;
+            else break;
         }
-        
-        NSUInteger remaining = needBytes - data.length;
-        NSUInteger available = g_audioCache.length - g_audioCacheOffset;
-        NSUInteger copyLen = MIN(remaining, available);
-        
-        [data appendBytes:((uint8_t *)g_audioCache.bytes + g_audioCacheOffset) length:copyLen];
-        g_audioCacheOffset += copyLen;
+        NSUInteger left = need - d.length;
+        NSUInteger avail = g_audioCache.length - g_audioOffset;
+        NSUInteger cp = MIN(left, avail);
+        [d appendBytes:((uint8_t *)g_audioCache.bytes + g_audioOffset) length:cp];
+        g_audioOffset += cp;
     }
-    
-    if (data.length < needBytes) {
-        [data increaseLengthBy:needBytes - data.length];
+
+    if (d.length < need) {
+        [d increaseLengthBy:need - d.length];
     }
-    
-    [g_mediaLock unlock];
-    return data;
+
+    [g_lock unlock];
+    return d;
 }
 
-#pragma mark - 视频绘制
-
-static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
-    if (!g_fileManager || !g_tempFile || ![g_fileManager fileExistsAtPath:g_tempFile]) return;
-    static NSTimeInterval lastLoad = 0;
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    NSString *newMark = [g_tempFile stringByAppendingString:@".new"];
-    if ([g_fileManager fileExistsAtPath:newMark] && (now - lastLoad) > 1.0) {
-        lastLoad = now;
-        [g_fileManager removeItemAtPath:newMark error:nil];
-        SetupVideoReader(g_tempFile);
-        LoadAudioFromFile(g_tempFile);
-    }
-    CVPixelBufferRef src = GetNextVideoPixelBuffer();
-    if (!src) return;
-    CIImage *srcImage = [CIImage imageWithCVPixelBuffer:src];
-    CVPixelBufferRelease(src);
-    if (!srcImage) return;
-
-    CGAffineTransform transform = CGAffineTransformIdentity;
-    CGRect extent = srcImage.extent;
-    if (g_rotation == 90) {
-        transform = CGAffineTransformMakeTranslation(extent.size.height, 0);
-        transform = CGAffineTransformRotate(transform, M_PI_2);
-    } else if (g_rotation == 180) {
-        transform = CGAffineTransformMakeTranslation(extent.size.width, extent.size.height);
-        transform = CGAffineTransformRotate(transform, M_PI);
-    } else if (g_rotation == 270) {
-        transform = CGAffineTransformMakeTranslation(0, extent.size.width);
-        transform = CGAffineTransformRotate(transform, 3 * M_PI_2);
-    }
-    CIImage *rotated = [srcImage imageByApplyingTransform:transform];
-
-    size_t targetWidth = CVPixelBufferGetWidth(targetBuffer);
-    size_t targetHeight = CVPixelBufferGetHeight(targetBuffer);
-    CGFloat scale = MAX(targetWidth / rotated.extent.size.width,
-                        targetHeight / rotated.extent.size.height);
-    CIImage *scaled = [rotated imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
-    CIImage *final = [scaled imageByApplyingTransform:
-        CGAffineTransformMakeTranslation((targetWidth - scaled.extent.size.width)/2.0,
-                                        (targetHeight - scaled.extent.size.height)/2.0)];
-
-    static CIContext *ctx = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        ctx = [CIContext contextWithOptions:nil];
-    });
-    CVPixelBufferLockBaseAddress(targetBuffer, 0);
-    [ctx render:final toCVPixelBuffer:targetBuffer];
-    CVPixelBufferUnlockBaseAddress(targetBuffer, 0);
-}
-
-#pragma mark - ✅ 原始文件：AudioUnitRender Hook
+#pragma mark - AudioUnitRender（✅ 原始 VCAM 行为）
 
 static OSStatus hooked_AudioUnitRender(
-    void *inRefCon,
-    AudioUnitRenderActionFlags *ioActionFlags,
-    const AudioTimeStamp *inTimeStamp,
-    UInt32 inBusNumber,
-    UInt32 inNumberFrames,
-    AudioBufferList *ioData
+    void *rc,
+    AudioUnitRenderActionFlags *f,
+    const AudioTimeStamp *ts,
+    UInt32 bus,
+    UInt32 frames,
+    AudioBufferList *io
 ) {
-    if (inBusNumber != 0 && inBusNumber != 1) {
-        return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    if (bus != 0 && bus != 1) {
+        return orig_AudioUnitRender(rc, f, ts, bus, frames, io);
     }
 
     if (!g_hasProbedMicFormat) {
-        AudioUnit au = (AudioUnit)inRefCon;
-        UInt32 size = sizeof(g_micASBD);
+        AudioUnit au = (AudioUnit)rc;
+        UInt32 sz = sizeof(g_micASBD);
         if (AudioUnitGetProperty(au,
                                  kAudioUnitProperty_StreamFormat,
                                  kAudioUnitScope_Input,
-                                 inBusNumber,
+                                 bus,
                                  &g_micASBD,
-                                 &size) == noErr) {
+                                 &sz) == noErr) {
             g_hasProbedMicFormat = YES;
-            if (g_tempFile) LoadAudioFromFile(g_tempFile);
+            if (g_tempFile) LoadAudio(g_tempFile, g_micASBD);
         } else {
             memset(&g_micASBD, 0, sizeof(g_micASBD));
-            g_micASBD.mSampleRate = 44100.0;
+            g_micASBD.mSampleRate = 44100;
             g_micASBD.mFormatID = kAudioFormatLinearPCM;
             g_micASBD.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
             g_micASBD.mBytesPerPacket = 4;
@@ -300,89 +229,120 @@ static OSStatus hooked_AudioUnitRender(
             g_micASBD.mChannelsPerFrame = 2;
             g_micASBD.mBitsPerChannel = 16;
             g_hasProbedMicFormat = YES;
-            if (g_tempFile) LoadAudioFromFile(g_tempFile);
+            if (g_tempFile) LoadAudio(g_tempFile, g_micASBD);
         }
     }
 
-    OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    OSStatus ret = orig_AudioUnitRender(rc, f, ts, bus, frames, io);
     if (ret != noErr) return ret;
 
-    if (g_isSoundEnabled && g_audioCache) {
-        UInt32 bytesPerFrame = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
-        UInt32 need = inNumberFrames * bytesPerFrame;
-        
-        if (need > 0 && ioData->mNumberBuffers > 0) {
-            NSData *audioData = GetAudioData(need);
-            if (audioData.length >= need) {
-                BOOL nonInterleaved = (g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
-                
-                if (nonInterleaved) {
-                    UInt32 bytesPerChannel = need / ioData->mNumberBuffers;
-                    for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
-                        AudioBuffer *buf = &ioData->mBuffers[i];
-                        if (buf->mData && buf->mDataByteSize >= bytesPerChannel) {
-                            memcpy(buf->mData, (uint8_t *)audioData.bytes + i * bytesPerChannel, bytesPerChannel);
-                        }
-                    }
-                } else {
-                    AudioBuffer *buf = &ioData->mBuffers[0];
-                    if (buf->mData && buf->mDataByteSize >= need) {
-                        memcpy(buf->mData, audioData.bytes, need);
-                    }
-                }
-            }
+    if (!g_isSoundEnabled || !g_audioCache) return ret;
+
+    UInt32 bpf = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
+    UInt32 need = frames * bpf;
+
+    NSData *d = ReadAudio(need);
+    if (d.length < need) return ret;
+
+    BOOL ni = (g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+
+    if (ni) {
+        UInt32 per = need / io->mNumberBuffers;
+        for (UInt32 i = 0; i < io->mNumberBuffers; i++) {
+            memcpy(io->mBuffers[i].mData,
+                   (uint8_t *)d.bytes + i * per,
+                   per);
         }
+    } else {
+        memcpy(io->mBuffers[0].mData, d.bytes, need);
     }
 
     return ret;
 }
 
-static void InstallAudioHook(void) {
-    MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&orig_AudioUnitRender);
-}
-
 #pragma mark - 视频代理
 
 @interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
-- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
 
 @implementation VCamVideoProxy {
-    __weak id _originalDelegate;
-}
-
-- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue {
-    _originalDelegate = delegate;
+    __weak id _orig;
 }
 
 - (void)captureOutput:(AVCaptureOutput *)output
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
+
     CVPixelBufferRef buf = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (buf) DrawReplacementOntoBuffer(buf);
-    if (_originalDelegate &&
-        [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-        [_originalDelegate captureOutput:output
-                     didOutputSampleBuffer:sampleBuffer
-                            fromConnection:connection];
+    if (!buf) return;
+
+    static NSTimeInterval last = 0;
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    NSString *mark = [g_tempFile stringByAppendingString:@".new"];
+    if ([g_fileManager fileExistsAtPath:mark] && now - last > 1.0) {
+        last = now;
+        [g_fileManager removeItemAtPath:mark error:nil];
+        SetupVideo(g_tempFile);
+        if (g_hasProbedMicFormat) LoadAudio(g_tempFile, g_micASBD);
+    }
+
+    CVPixelBufferRef src = ReadVideoFrame();
+    if (!src) return;
+
+    CIImage *img = [CIImage imageWithCVPixelBuffer:src];
+    CVPixelBufferRelease(src);
+    if (!img) return;
+
+    CGAffineTransform t = CGAffineTransformIdentity;
+    CGRect e = img.extent;
+    if (g_rotation == 90) {
+        t = CGAffineTransformMakeTranslation(e.size.height, 0);
+        t = CGAffineTransformRotate(t, M_PI_2);
+    } else if (g_rotation == 180) {
+        t = CGAffineTransformMakeTranslation(e.size.width, e.size.height);
+        t = CGAffineTransformRotate(t, M_PI);
+    } else if (g_rotation == 270) {
+        t = CGAffineTransformMakeTranslation(0, e.size.width);
+        t = CGAffineTransformRotate(t, 3 * M_PI_2);
+    }
+
+    CIImage *r = [img imageByApplyingTransform:t];
+    CGFloat scale = MAX(CVPixelBufferGetWidth(buf) / r.extent.size.width,
+                        CVPixelBufferGetHeight(buf) / r.extent.size.height);
+    CIImage *s = [r imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+    CIImage *f = [s imageByApplyingTransform:
+        CGAffineTransformMakeTranslation(
+            (CVPixelBufferGetWidth(buf) - s.extent.size.width)/2,
+            (CVPixelBufferGetHeight(buf) - s.extent.size.height)/2)];
+
+    static CIContext *ctx = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:nil]; });
+
+    CVPixelBufferLockBaseAddress(buf, 0);
+    [ctx render:f toCVPixelBuffer:buf];
+    CVPixelBufferUnlockBaseAddress(buf, 0);
+
+    if (_orig && [_orig respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+        [_orig captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
     }
 }
 
 @end
 
-static VCamVideoProxy *g_videoProxy = nil;
+static VCamVideoProxy *g_proxy = nil;
 
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
-    if (!g_videoProxy) g_videoProxy = [[VCamVideoProxy alloc] init];
-    [g_videoProxy setOriginalDelegate:delegate queue:queue];
-    %orig(g_videoProxy, queue);
+    if (!g_proxy) g_proxy = [VCamVideoProxy new];
+    ((VCamVideoProxy *)g_proxy)->_orig = delegate;
+    %orig(g_proxy, queue);
 }
 %end
 
-#pragma mark - 悬浮菜单
+#pragma mark - 菜单（✅ 原样保留）
 
-static UIWindow* GetCurrentKeyWindow(void) {
+static UIWindow* GetKeyWindow(void) {
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
         if (scene.activationState == UISceneActivationStateForegroundActive) {
             for (UIWindow *w in scene.windows)
@@ -594,12 +554,12 @@ static UIWindow* GetCurrentKeyWindow(void) {
 - (void)disableTapped {
     if ([g_fileManager fileExistsAtPath:g_tempFile])
         [g_fileManager removeItemAtPath:g_tempFile error:nil];
-    [g_mediaLock lock];
+    [g_lock lock];
     if (g_videoReader) [g_videoReader cancelReading];
     g_videoReader = nil;
     g_audioCache = nil;
-    g_audioCacheOffset = 0;
-    [g_mediaLock unlock];
+    g_audioOffset = 0;
+    [g_lock unlock];
     [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
 }
 
@@ -608,7 +568,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
 static void ShowVCamMenu(void) {
     if (g_isPresentingMenu) return;
     g_isPresentingMenu = YES;
-    UIWindow *key = GetCurrentKeyWindow();
+    UIWindow *key = GetKeyWindow();
     if (!key) { g_isPresentingMenu = NO; return; }
     VCamMenuViewController *vc = [[VCamMenuViewController alloc] init];
     vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
@@ -651,24 +611,19 @@ static void AddGestureToWindow(UIWindow *win) {
 }
 %end
 
-#pragma mark - 构造 / 析构
+#pragma mark - 构造
 
 %ctor {
-    g_fileManager = [NSFileManager defaultManager];
-    g_mediaLock = [[NSLock alloc] init];
+    g_fileManager = NSFileManager.defaultManager;
+    g_lock = [[NSLock alloc] init];
     LoadSettings();
-    g_tempFile = [[GetDocumentPath() stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) {
-        SetupVideoReader(g_tempFile);
-        LoadAudioFromFile(g_tempFile);
-    }
-    InstallAudioHook();
-}
+    g_tempFile = [[DocPath() stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
 
-%dtor {
-    [g_mediaLock lock];
-    if (g_videoReader) [g_videoReader cancelReading];
-    g_videoReader = nil;
-    g_audioCache = nil;
-    [g_mediaLock unlock];
+    if ([g_fileManager fileExistsAtPath:g_tempFile]) {
+        SetupVideo(g_tempFile);
+    }
+
+    MSHookFunction((void *)AudioUnitRender,
+                   (void *)hooked_AudioUnitRender,
+                   (void **)&orig_AudioUnitRender);
 }
