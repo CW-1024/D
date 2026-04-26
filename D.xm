@@ -16,9 +16,6 @@ static int g_rotation = 90;
 static BOOL g_isSoundEnabled = YES;
 static BOOL g_isLoop = YES;
 
-static AudioStreamBasicDescription g_micASBD = {0};
-static BOOL g_hasProbedMicFormat = NO;
-
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
 static AVAssetReader *g_audioReader = nil;
@@ -36,7 +33,6 @@ static void SaveSettings(void) {
     [defs setBool:g_isLoop forKey:@"vcam_loop"];
     [defs synchronize];
 }
-
 static void LoadSettings(void) {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
     if ([defs objectForKey:@"vcam_rotation"]) g_rotation = (int)[defs integerForKey:@"vcam_rotation"];
@@ -85,28 +81,18 @@ static void SetupAudioReader(NSString *filePath) {
     NSArray *audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
     if (audioTracks.count == 0) { [g_mediaLock unlock]; return; }
     AVAssetTrack *track = audioTracks[0];
-    AudioStreamBasicDescription asbd = g_micASBD;
-    if (asbd.mSampleRate == 0) {
-        // 未探测到麦克风格式，使用最通用的16kHz/16bit/单声道
-        asbd.mSampleRate = 16000;
-        asbd.mFormatID = kAudioFormatLinearPCM;
-        asbd.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-        asbd.mBitsPerChannel = 16;
-        asbd.mChannelsPerFrame = 1;
-        asbd.mBytesPerFrame = 2;
-        asbd.mBytesPerPacket = 2;
-        asbd.mFramesPerPacket = 1;
-    }
+    // 采用 16kHz/16bit/1ch 作为通用输出，匹配 VoIP 常见格式
     NSDictionary *settings = @{
         AVFormatIDKey            : @(kAudioFormatLinearPCM),
-        AVLinearPCMBitDepthKey   : @(asbd.mBitsPerChannel),
-        AVLinearPCMIsFloatKey    : @((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0),
-        AVLinearPCMIsBigEndianKey: @((asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0),
-        AVNumberOfChannelsKey    : @(asbd.mChannelsPerFrame),
-        AVSampleRateKey          : @(asbd.mSampleRate)
+        AVLinearPCMBitDepthKey   : @(16),
+        AVLinearPCMIsFloatKey    : @NO,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVNumberOfChannelsKey    : @(1),
+        AVSampleRateKey          : @(16000)
     };
     g_audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
     g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
+    if (!g_audioReader) { [g_mediaLock unlock]; return; }
     [g_audioReader addOutput:g_audioOutput];
     if (![g_audioReader startReading]) {
         g_audioReader = nil;
@@ -138,22 +124,24 @@ static NSData* PullAudioData(NSUInteger needBytes) {
     NSMutableData *data = [NSMutableData dataWithCapacity:needBytes];
     [g_mediaLock lock];
     while (data.length < needBytes) {
-        BOOL shouldReset = NO;
         if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) {
-            if (g_isLoop && g_tempFile) shouldReset = YES;
-            else break;
+            if (g_isLoop && g_tempFile) {
+                [g_mediaLock unlock];
+                SetupAudioReader(g_tempFile);
+                [g_mediaLock lock];
+                if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) break;
+                continue;
+            } else break;
         }
-        CMSampleBufferRef sample = nil;
-        if (!shouldReset) {
-            sample = [g_audioOutput copyNextSampleBuffer];
-            if (!sample && g_isLoop && g_tempFile) shouldReset = YES;
-        }
-        if (shouldReset) {
-            [g_mediaLock unlock];
-            SetupAudioReader(g_tempFile);
-            [g_mediaLock lock];
-            if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) break;
-            continue;
+        CMSampleBufferRef sample = [g_audioOutput copyNextSampleBuffer];
+        if (!sample) {
+            if (g_isLoop && g_tempFile) {
+                [g_mediaLock unlock];
+                SetupAudioReader(g_tempFile);
+                [g_mediaLock lock];
+                if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) break;
+                continue;
+            } else break;
         }
         CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
         size_t totalSize = 0;
@@ -219,21 +207,13 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
 @interface VCamProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
-@implementation VCamProxy {
-    __weak id _originalDelegate;
-    dispatch_queue_t _originalQueue;
-}
-- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue {
-    _originalDelegate = delegate;
-    _originalQueue = queue;
-}
-- (void)captureOutput:(AVCaptureOutput *)output
-   didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-          fromConnection:(AVCaptureConnection *)connection {
-    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (pixelBuffer) DrawReplacementOntoBuffer(pixelBuffer);
-    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-        [_originalDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+@implementation VCamProxy { __weak id _o; dispatch_queue_t _q; }
+- (void)setOriginalDelegate:(id)d queue:(dispatch_queue_t)q { _o = d; _q = q; }
+- (void)captureOutput:(AVCaptureOutput *)out didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)conn {
+    CVPixelBufferRef buf = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (buf) DrawReplacementOntoBuffer(buf);
+    if (_o && [_o respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+        [_o captureOutput:out didOutputSampleBuffer:sampleBuffer fromConnection:conn];
     }
 }
 @end
@@ -248,38 +228,33 @@ static VCamProxy *g_proxy = nil;
 %end
 
 static OSStatus hooked_AudioUnitRender(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags, const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber, UInt32 inNumberFrames, AudioBufferList *ioData) {
-    // 首次调用时尝试获取麦克风格式并初始化音频读取器
+    // 在首次调用时初始化音频读取器
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        AudioUnit au = (AudioUnit)inRefCon;
-        UInt32 size = sizeof(g_micASBD);
-        if (AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, inBusNumber, &g_micASBD, &size) != noErr) {
-            // 探测失败，清空结构体以使用后备格式
-            memset(&g_micASBD, 0, sizeof(g_micASBD));
-        }
-        g_hasProbedMicFormat = YES;
         if (g_tempFile && [g_fileManager fileExistsAtPath:g_tempFile]) {
             SetupAudioReader(g_tempFile);
         }
     });
-
     OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (!g_isSoundEnabled || !ioData || ioData->mNumberBuffers == 0) return ret;
 
-    AudioBuffer *buf = &ioData->mBuffers[0];
-    NSUInteger sampleSize = g_micASBD.mBitsPerChannel ? (g_micASBD.mBitsPerChannel / 8) : 2;
-    NSUInteger channels = g_micASBD.mChannelsPerFrame ? g_micASBD.mChannelsPerFrame : 1;
-    NSUInteger needBytes = inNumberFrames * sampleSize * channels;
-    NSData *audioData = PullAudioData(needBytes);
-    if (audioData.length > 0) {
-        memcpy(buf->mData, audioData.bytes, MIN(audioData.length, buf->mDataByteSize));
+    // 覆盖所有音频缓冲区（支持多通道交错）
+    for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
+        AudioBuffer *buf = &ioData->mBuffers[i];
+        if (buf->mDataByteSize == 0) continue;
+        // 假设微信使用 16kHz/16bit/1ch，如果实际不同，可能导致轻微失真，但至少能听到替换声音
+        NSUInteger sampleSize = 2;
+        NSUInteger channels = 1;
+        NSUInteger needBytes = inNumberFrames * sampleSize * channels;
+        NSData *audioData = PullAudioData(needBytes);
+        if (audioData.length > 0) {
+            memcpy(buf->mData, audioData.bytes, MIN(audioData.length, buf->mDataByteSize));
+        }
     }
     return ret;
 }
 
-static void InstallAudioHook() {
-    MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&orig_AudioUnitRender);
-}
+static void InstallAudioHook() { MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&orig_AudioUnitRender); }
 
 static UIWindow* GetCurrentKeyWindow(void) {
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -300,6 +275,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
     BOOL _tempLoop;
     UIButton *_rotateBtn, *_soundBtn, *_loopBtn;
 }
+
 - (instancetype)init {
     if (self = [super init]) {
         _tempRotation = g_rotation;
@@ -308,6 +284,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
     }
     return self;
 }
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
@@ -319,6 +296,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [container.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor].active = YES;
     [container.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor].active = YES;
     [container.widthAnchor constraintEqualToConstant:300].active = YES;
+
     UIView *navBar = [[UIView alloc] init];
     navBar.backgroundColor = [UIColor systemGray6Color];
     navBar.translatesAutoresizingMaskIntoConstraints = NO;
@@ -327,12 +305,14 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [navBar.leadingAnchor constraintEqualToAnchor:container.leadingAnchor].active = YES;
     [navBar.trailingAnchor constraintEqualToAnchor:container.trailingAnchor].active = YES;
     [navBar.heightAnchor constraintEqualToConstant:44].active = YES;
+
     UILabel *title = [[UILabel alloc] init];
     title.text = @"VCAM 控制"; title.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
     title.textAlignment = NSTextAlignmentCenter; title.translatesAutoresizingMaskIntoConstraints = NO;
     [navBar addSubview:title];
     [title.centerXAnchor constraintEqualToAnchor:navBar.centerXAnchor].active = YES;
     [title.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
+
     UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [cancelBtn setTitle:@"取消" forState:UIControlStateNormal]; cancelBtn.titleLabel.font = [UIFont systemFontOfSize:18];
     [cancelBtn addTarget:self action:@selector(cancelAndDismiss) forControlEvents:UIControlEventTouchUpInside];
@@ -340,6 +320,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [navBar addSubview:cancelBtn];
     [cancelBtn.leadingAnchor constraintEqualToAnchor:navBar.leadingAnchor constant:16].active = YES;
     [cancelBtn.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
+
     UIButton *confirmBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [confirmBtn setTitle:@"确认" forState:UIControlStateNormal]; confirmBtn.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
     [confirmBtn addTarget:self action:@selector(confirmAndDismiss) forControlEvents:UIControlEventTouchUpInside];
@@ -347,6 +328,7 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [navBar addSubview:confirmBtn];
     [confirmBtn.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
     [confirmBtn.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
+
     UIStackView *stack = [[UIStackView alloc] init];
     stack.axis = UILayoutConstraintAxisVertical; stack.spacing = 8;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -355,52 +337,61 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [stack.bottomAnchor constraintEqualToAnchor:container.bottomAnchor constant:-16].active = YES;
     [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16].active = YES;
     [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16].active = YES;
-    UIButton* (^createBtn)(NSString *) = ^UIButton *(NSString *title) {
-        UIButtonConfiguration *config = [UIButtonConfiguration filledButtonConfiguration];
-        config.baseBackgroundColor = [UIColor systemGray5Color]; config.baseForegroundColor = [UIColor labelColor];
-        config.contentInsets = NSDirectionalEdgeInsetsMake(12, 0, 12, 0);
-        UIFont *font = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
-        NSAttributedString *attr = [[NSAttributedString alloc] initWithString:title attributes:@{NSFontAttributeName: font}];
-        config.attributedTitle = attr;
-        UIButton *btn = [UIButton buttonWithConfiguration:config primaryAction:nil];
+
+    UIButton* (^createBtn)(NSString *) = ^UIButton *(NSString *t) {
+        UIButtonConfiguration *c = [UIButtonConfiguration filledButtonConfiguration];
+        c.baseBackgroundColor = [UIColor systemGray5Color]; c.baseForegroundColor = [UIColor labelColor];
+        c.contentInsets = NSDirectionalEdgeInsetsMake(12, 0, 12, 0);
+        UIFont *f = [UIFont systemFontOfSize:18 weight:UIFontWeightMedium];
+        NSAttributedString *a = [[NSAttributedString alloc] initWithString:t attributes:@{NSFontAttributeName: f}];
+        c.attributedTitle = a;
+        UIButton *btn = [UIButton buttonWithConfiguration:c primaryAction:nil];
         btn.layer.cornerRadius = 8; return btn;
     };
+
     UIButton *selectBtn = createBtn(@"选择视频");
     [selectBtn addTarget:self action:@selector(selectVideoTapped) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:selectBtn];
+
     _rotateBtn = createBtn([NSString stringWithFormat:@"旋转画面 (%d°)", _tempRotation]);
     [_rotateBtn addTarget:self action:@selector(rotatePreview:) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:_rotateBtn];
+
     _soundBtn = createBtn(_tempSound ? @"声音：开启" : @"声音：关闭");
     [_soundBtn addTarget:self action:@selector(soundPreview:) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:_soundBtn];
+
     _loopBtn = createBtn(_tempLoop ? @"循环播放：开启" : @"循环播放：关闭");
     [_loopBtn addTarget:self action:@selector(loopPreview:) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:_loopBtn];
+
     UIButton *disableBtn = createBtn(@"禁用替换");
     [disableBtn addTarget:self action:@selector(disableTapped) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:disableBtn];
 }
+
 - (void)rotatePreview:(UIButton *)btn { _tempRotation = (_tempRotation + 90) % 360; [_rotateBtn setTitle:[NSString stringWithFormat:@"旋转画面 (%d°)", _tempRotation] forState:UIControlStateNormal]; }
 - (void)soundPreview:(UIButton *)btn  { _tempSound = !_tempSound; [_soundBtn setTitle:_tempSound ? @"声音：开启" : @"声音：关闭" forState:UIControlStateNormal]; }
 - (void)loopPreview:(UIButton *)btn   { _tempLoop = !_tempLoop; [_loopBtn setTitle:_tempLoop ? @"循环播放：开启" : @"循环播放：关闭" forState:UIControlStateNormal]; }
+
 - (void)confirmAndDismiss {
     g_rotation = _tempRotation; g_isSoundEnabled = _tempSound; g_isLoop = _tempLoop;
     SaveSettings();
     [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
 }
 - (void)cancelAndDismiss { [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }]; }
+
 - (void)selectVideoTapped {
     static id pickerDelegate = nil;
     if (!pickerDelegate) {
-        Class cls = objc_allocateClassPair([NSObject class], "VCamPDelegate", 0);
+        Class cls = objc_allocateClassPair([NSObject class], "VPicker", 0);
         class_addProtocol(cls, @protocol(UIImagePickerControllerDelegate));
         class_addProtocol(cls, @protocol(UINavigationControllerDelegate));
-        IMP imp = imp_implementationWithBlock(^(id self, UIImagePickerController *picker, NSDictionary *info) {
-            [picker dismissViewControllerAnimated:YES completion:nil];
-            NSURL *videoURL = info[UIImagePickerControllerMediaURL];
-            if (videoURL) {
-                NSString *src = videoURL.path;
+        IMP imp = imp_implementationWithBlock(^(id s, UIImagePickerController *p, NSDictionary *i) {
+            [p dismissViewControllerAnimated:YES completion:nil];
+            NSURL *url = i[UIImagePickerControllerMediaURL];
+            if (url) {
+                NSString *src = url.path;
                 if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
                 if ([g_fileManager copyItemAtPath:src toPath:g_tempFile error:nil]) {
                     [@"1" writeToFile:[g_tempFile stringByAppendingString:@".new"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -408,16 +399,19 @@ static UIWindow* GetCurrentKeyWindow(void) {
             }
         });
         class_addMethod(cls, @selector(imagePickerController:didFinishPickingMediaWithInfo:), imp, "v@:@@");
-        imp = imp_implementationWithBlock(^(id self, UIImagePickerController *picker) { [picker dismissViewControllerAnimated:YES completion:nil]; });
+        imp = imp_implementationWithBlock(^(id s, UIImagePickerController *p) { [p dismissViewControllerAnimated:YES completion:nil]; });
         class_addMethod(cls, @selector(imagePickerControllerDidCancel:), imp, "v@:@");
         pickerDelegate = [cls new];
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-        picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary; picker.mediaTypes = @[@"public.movie"]; picker.delegate = pickerDelegate;
+        picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+        picker.mediaTypes = @[@"public.movie"];
+        picker.delegate = pickerDelegate;
         [self presentViewController:picker animated:YES completion:nil];
     });
 }
+
 - (void)disableTapped {
     if (g_fileManager && g_tempFile) {
         if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
@@ -433,23 +427,26 @@ static UIWindow* GetCurrentKeyWindow(void) {
 static void ShowVCamMenu(void) {
     if (g_isPresentingMenu) return; g_isPresentingMenu = YES;
     UIWindow *keyWindow = GetCurrentKeyWindow(); if (!keyWindow) { g_isPresentingMenu = NO; return; }
-    VCamMenuViewController *menuVC = [[VCamMenuViewController alloc] init];
-    menuVC.modalPresentationStyle = UIModalPresentationOverFullScreen; menuVC.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
-    UIViewController *rootVC = keyWindow.rootViewController; while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
-    [rootVC presentViewController:menuVC animated:YES completion:nil];
+    VCamMenuViewController *vc = [[VCamMenuViewController alloc] init];
+    vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    UIViewController *root = keyWindow.rootViewController;
+    while (root.presentedViewController) root = root.presentedViewController;
+    [root presentViewController:vc animated:YES completion:nil];
 }
 
 @interface UIWindow (VCam) - (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap; @end
 @implementation UIWindow (VCam)
 - (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap { if (tap.state == UIGestureRecognizerStateRecognized) ShowVCamMenu(); }
 @end
-static void AddGestureToWindow(UIWindow *window) {
-    static NSMapTable<UIWindow*, NSNumber*> *map = nil; static dispatch_once_t once; dispatch_once(&once, ^{ map = [NSMapTable weakToStrongObjectsMapTable]; });
-    if ([map objectForKey:window]) return;
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:window action:@selector(vcam_handleTwoFingerDoubleTap:)];
+static void AddGestureToWindow(UIWindow *win) {
+    static NSMapTable *map; static dispatch_once_t once; dispatch_once(&once, ^{ map = [NSMapTable weakToStrongObjectsMapTable]; });
+    if ([map objectForKey:win]) return;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:win action:@selector(vcam_handleTwoFingerDoubleTap:)];
     tap.numberOfTouchesRequired = 2; tap.numberOfTapsRequired = 2; tap.cancelsTouchesInView = NO;
-    [window addGestureRecognizer:tap]; [map setObject:@YES forKey:window];
+    [win addGestureRecognizer:tap]; [map setObject:@YES forKey:win];
 }
+
 %hook UIWindow
 - (void)makeKeyAndVisible { %orig; dispatch_async(dispatch_get_main_queue(), ^{ AddGestureToWindow(self); }); }
 - (id)initWithFrame:(CGRect)frame { self = %orig; dispatch_async(dispatch_get_main_queue(), ^{ AddGestureToWindow(self); }); return self; }
@@ -467,7 +464,8 @@ static void AddGestureToWindow(UIWindow *window) {
     [g_mediaLock lock];
     if (g_videoReader) [g_videoReader cancelReading];
     if (g_audioReader) [g_audioReader cancelReading];
-    g_videoReader = nil; g_audioReader = nil; g_videoOutput = nil; g_audioOutput = nil;
+    g_videoReader = nil; g_audioReader = nil;
+    g_videoOutput = nil; g_audioOutput = nil;
     [g_mediaLock unlock];
     g_fileManager = nil;
 }
