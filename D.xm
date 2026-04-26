@@ -262,11 +262,16 @@ static OSStatus hooked_AudioUnitRender(
 
 #pragma mark - 视频代理
 
-@interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
+@interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate> {
+    __weak id _originalDelegate;
+}
+- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
 
-@implementation VCamVideoProxy {
-    __weak id _orig;
+@implementation VCamVideoProxy
+
+- (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    _originalDelegate = delegate;
 }
 
 - (void)captureOutput:(AVCaptureOutput *)output
@@ -323,8 +328,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     [ctx render:f toCVPixelBuffer:buf];
     CVPixelBufferUnlockBaseAddress(buf, 0);
 
-    if (_orig && [_orig respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
-        [_orig captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+    if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
+        [_originalDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
     }
 }
 
@@ -335,7 +340,7 @@ static VCamVideoProxy *g_proxy = nil;
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
     if (!g_proxy) g_proxy = [VCamVideoProxy new];
-    ((VCamVideoProxy *)g_proxy)->_orig = delegate;
+    [g_proxy setOriginalDelegate:delegate queue:queue];
     %orig(g_proxy, queue);
 }
 %end
@@ -353,15 +358,17 @@ static UIWindow* GetKeyWindow(void) {
     return nil;
 }
 
-@interface VCamMenuViewController : UIViewController
-@end
-
-@implementation VCamMenuViewController {
+@interface VCamMenuViewController : UIViewController {
     int _tempRotation;
     BOOL _tempSound;
     BOOL _tempLoop;
-    UIButton *_rotateBtn, *_soundBtn, *_loopBtn;
+    UIButton *_rotateBtn;
+    UIButton *_soundBtn;
+    UIButton *_loopBtn;
 }
+@end
+
+@implementation VCamMenuViewController
 
 - (instancetype)init {
     if (self = [super init]) {
