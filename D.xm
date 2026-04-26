@@ -74,6 +74,7 @@ static void SetupVideoReader(NSString *filePath) {
     [g_mediaLock unlock];
 }
 
+// 修正：移除 AVLinearPCMIsNonInterleaved
 static void SetupAudioReader(NSString *filePath) {
     [g_mediaLock lock];
     if (g_audioReader) {
@@ -95,7 +96,6 @@ static void SetupAudioReader(NSString *filePath) {
         AVLinearPCMBitDepthKey   : @(asbd.mBitsPerChannel),
         AVLinearPCMIsFloatKey    : @((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0),
         AVLinearPCMIsBigEndianKey: @((asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0),
-        AVLinearPCMIsNonInterleaved: @((asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0),
         AVNumberOfChannelsKey    : @(asbd.mChannelsPerFrame),
         AVSampleRateKey          : @(asbd.mSampleRate)
     };
@@ -143,9 +143,7 @@ static NSData* PullAudioData(NSUInteger needBytes) {
             [g_mediaLock unlock];
             SetupAudioReader(g_tempFile);
             [g_mediaLock lock];
-            if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) {
-                break;
-            }
+            if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) break;
             continue;
         }
         CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
@@ -232,9 +230,7 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
    didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
           fromConnection:(AVCaptureConnection *)connection {
     CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (pixelBuffer) {
-        DrawReplacementOntoBuffer(pixelBuffer);
-    }
+    if (pixelBuffer) DrawReplacementOntoBuffer(pixelBuffer);
     if (_originalDelegate && [_originalDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)]) {
         [_originalDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
     }
@@ -250,6 +246,7 @@ static VCamProxy *g_proxy = nil;
 }
 %end
 
+// 修正：先尝试 element 1，失败则尝试 element 0
 static OSStatus hooked_AudioUnitRender(void *inRefCon,
                                        AudioUnitRenderActionFlags *ioActionFlags,
                                        const AudioTimeStamp *inTimeStamp,
@@ -259,10 +256,12 @@ static OSStatus hooked_AudioUnitRender(void *inRefCon,
     if (!g_hasProbedMicFormat) {
         AudioUnit au = (AudioUnit)inRefCon;
         UInt32 size = sizeof(g_micASBD);
-        if (AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &g_micASBD, &size) == noErr) {
-            g_hasProbedMicFormat = YES;
-            if (g_tempFile && [g_fileManager fileExistsAtPath:g_tempFile]) SetupAudioReader(g_tempFile);
+        if (AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &g_micASBD, &size) != noErr &&
+            AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &g_micASBD, &size) != noErr) {
+            return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
         }
+        g_hasProbedMicFormat = YES;
+        if (g_tempFile && [g_fileManager fileExistsAtPath:g_tempFile]) SetupAudioReader(g_tempFile);
     }
     OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (!g_isSoundEnabled || !ioData || ioData->mNumberBuffers == 0) return ret;
@@ -518,9 +517,7 @@ static void AddGestureToWindow(UIWindow *window) {
     g_mediaLock = [[NSLock alloc] init];
     LoadSettings();
     g_tempFile = [[GetDocumentPath() stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) {
-        SetupVideoReader(g_tempFile);
-    }
+    if ([g_fileManager fileExistsAtPath:g_tempFile]) SetupVideoReader(g_tempFile);
     InstallAudioHook();
 }
 
