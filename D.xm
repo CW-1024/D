@@ -171,8 +171,8 @@ static NSData* PullAudioData(NSUInteger needBytes) {
         CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
         size_t totalSize = 0;
         if (block) {
-            // 获取音频数据真实长度
-            CMBlockBufferGetDataPointer(block, 0, NULL, &totalSize, NULL);
+            OSStatus err = CMBlockBufferGetDataPointer(block, 0, NULL, &totalSize, NULL);
+            if (err != kCMBlockBufferNoErr) totalSize = 0;
         }
         if (totalSize > 0) {
             NSUInteger remaining = needBytes - data.length;
@@ -188,7 +188,6 @@ static NSData* PullAudioData(NSUInteger needBytes) {
         CFRelease(sample);
     }
     [g_mediaLock unlock];
-    // 不足时补静音
     if (data.length < needBytes) {
         NSMutableData *padded = [NSMutableData dataWithData:data];
         [padded increaseLengthBy:needBytes - data.length];
@@ -245,18 +244,16 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     CVPixelBufferUnlockBaseAddress(targetBuffer, 0);
 }
 
-#pragma mark - 视频代理（替换帧）
+#pragma mark - 视频代理（仅用于替换画面，不涉及音频）
 
 @interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
 @end
 @implementation VCamVideoProxy {
     __weak id _originalDelegate;
-    dispatch_queue_t _originalQueue;
 }
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue {
     _originalDelegate = delegate;
-    _originalQueue = queue;
 }
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
     CVPixelBufferRef buf = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -282,10 +279,11 @@ static OSStatus hooked_AudioUnitRender(void *inRefCon, AudioUnitRenderActionFlag
                                         const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber,
                                         UInt32 inNumberFrames, AudioBufferList *ioData) {
     // 只处理麦克风输入总线 (RemoteIO 的 Bus 1)
+    // 注：某些音频单元麦克风在 Bus 0，但 RemoteIO 麦克风是 Bus 1
     if (inBusNumber != 1) {
         return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     }
-
+    
     // 第一次调用时探测麦克风实际格式（使用 Output Scope）
     if (!g_hasProbedMicFormat) {
         AudioUnit au = (AudioUnit)inRefCon;
@@ -313,22 +311,22 @@ static OSStatus hooked_AudioUnitRender(void *inRefCon, AudioUnitRenderActionFlag
             }
         }
     }
-
-    // 调用原始 AudioUnitRender 填充 ioData（麦克风真实数据）
+    
+    // 调用原始 AudioUnitRender 获取麦克风真实数据（会填充 ioData）
     OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (ret != noErr) return ret;
-
+    
     // 替换音频数据（当声音开关开启且音频读取器可用时）
     if (g_isSoundEnabled && g_audioReader && g_audioReader.status == AVAssetReaderStatusReading) {
         UInt32 needBytes = inNumberFrames * g_micASBD.mBytesPerFrame;
         if (needBytes > 0 && ioData->mNumberBuffers > 0) {
             NSData *replacement = PullAudioData(needBytes);
             if (replacement.length >= needBytes) {
-                const void *src = replacement.bytes;
+                const void *srcData = replacement.bytes;
                 for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
                     AudioBuffer *buf = &ioData->mBuffers[i];
                     if (buf->mData && buf->mDataByteSize >= needBytes) {
-                        memcpy(buf->mData, src, needBytes);
+                        memcpy(buf->mData, srcData, needBytes);
                     }
                 }
             }
