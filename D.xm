@@ -16,8 +16,12 @@ static int g_rotation = 90;
 static BOOL g_isSoundEnabled = YES;
 static BOOL g_isLoop = YES;
 
+// 麦克风格式
 static AudioStreamBasicDescription g_micASBD = {0};
 static BOOL g_hasProbedMicFormat = NO;
+
+// 视频音频原始声道数
+static UInt32 g_sourceAudioChannels = 0;
 
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
@@ -80,22 +84,28 @@ static void SetupAudioReader(NSString *filePath) {
         g_audioReader = nil;
         g_audioOutput = nil;
     }
-    if (!g_hasProbedMicFormat) {
-        [g_mediaLock unlock];
-        return;
-    }
     AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:filePath]];
     NSArray *audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
     if (audioTracks.count == 0) { [g_mediaLock unlock]; return; }
     AVAssetTrack *track = audioTracks[0];
-    AudioStreamBasicDescription asbd = g_micASBD;
+    
+    // 获取视频音频的自然格式描述
+    NSArray *formatDescs = [track formatDescriptions];
+    CMFormatDescriptionRef desc = (__bridge CMFormatDescriptionRef)[formatDescs firstObject];
+    const AudioStreamBasicDescription *sourceASBD = CMAudioFormatDescriptionGetStreamBasicDescription(desc);
+    if (!sourceASBD) { [g_mediaLock unlock]; return; }
+    
+    // 记录原始声道数，用于后续混音
+    g_sourceAudioChannels = sourceASBD->mChannelsPerFrame;
+    
+    // 输出 PCM 格式保持原始声道数，仅指定为标准的 16位有符号整数
     NSDictionary *settings = @{
         AVFormatIDKey            : @(kAudioFormatLinearPCM),
-        AVLinearPCMBitDepthKey   : @(asbd.mBitsPerChannel),
-        AVLinearPCMIsFloatKey    : @((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0),
-        AVLinearPCMIsBigEndianKey: @((asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0),
-        AVNumberOfChannelsKey    : @(asbd.mChannelsPerFrame),
-        AVSampleRateKey          : @(asbd.mSampleRate)
+        AVLinearPCMBitDepthKey   : @(16),
+        AVLinearPCMIsFloatKey    : @NO,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVNumberOfChannelsKey    : @(g_sourceAudioChannels),
+        AVSampleRateKey          : @(sourceASBD->mSampleRate)
     };
     g_audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
     g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
@@ -242,14 +252,39 @@ static OSStatus hooked_AudioUnitRender(void *inRefCon, AudioUnitRenderActionFlag
     }
     OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (!g_isSoundEnabled || !ioData || ioData->mNumberBuffers == 0) return ret;
-    for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
-        AudioBuffer *buf = &ioData->mBuffers[i];
-        if (buf->mDataByteSize == 0) continue;
-        NSUInteger sampleSize = g_micASBD.mBitsPerChannel / 8;
-        NSUInteger channels = g_micASBD.mChannelsPerFrame;
-        NSUInteger needBytes = inNumberFrames * sampleSize * channels;
-        NSData *audioData = PullAudioData(needBytes);
-        if (audioData.length > 0) memcpy(buf->mData, audioData.bytes, MIN(audioData.length, buf->mDataByteSize));
+    
+    UInt32 micChannels = g_micASBD.mChannelsPerFrame;
+    UInt32 sampleSize  = g_micASBD.mBitsPerChannel / 8;
+    NSUInteger needBytes = inNumberFrames * sampleSize * micChannels;
+    
+    NSData *audioData = PullAudioData(needBytes);
+    if (audioData.length > 0) {
+        for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
+            AudioBuffer *buf = &ioData->mBuffers[i];
+            if (buf->mDataByteSize == 0) continue;
+            if (g_sourceAudioChannels == micChannels) {
+                // 声道数相同，直接拷贝
+                memcpy(buf->mData, audioData.bytes, MIN(audioData.length, buf->mDataByteSize));
+            } else if (g_sourceAudioChannels == 2 && micChannels == 1) {
+                // 立体声 → 单声道：取左右声道平均值
+                SInt16 *src = (SInt16 *)audioData.bytes;
+                SInt16 *dst = (SInt16 *)buf->mData;
+                NSUInteger frames = MIN(audioData.length / (2 * sizeof(SInt16)), buf->mDataByteSize / sizeof(SInt16));
+                for (NSUInteger f = 0; f < frames; f++) {
+                    SInt32 sum = (SInt32)src[f*2] + (SInt32)src[f*2+1];
+                    dst[f] = (SInt16)(sum / 2);
+                }
+            } else if (g_sourceAudioChannels == 1 && micChannels == 2) {
+                // 单声道 → 立体声：复制到左右声道
+                SInt16 *src = (SInt16 *)audioData.bytes;
+                SInt16 *dst = (SInt16 *)buf->mData;
+                NSUInteger frames = MIN(audioData.length / sizeof(SInt16), buf->mDataByteSize / (2 * sizeof(SInt16)));
+                for (NSUInteger f = 0; f < frames; f++) {
+                    dst[f*2] = src[f];
+                    dst[f*2+1] = src[f];
+                }
+            }
+        }
     }
     return ret;
 }
@@ -357,7 +392,6 @@ static void AddGestureToWindow(UIWindow *win) {
     g_tempFile = [[GetDocumentPath() stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
     if ([g_fileManager fileExistsAtPath:g_tempFile]) {
         SetupVideoReader(g_tempFile);
-        // 音频读取器将在 AudioUnitRender 探测成功后创建
     }
     InstallAudioHook();
 }
