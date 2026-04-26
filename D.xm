@@ -14,12 +14,14 @@
 static NSFileManager *g_fileManager = nil;
 static NSString *g_tempFile = nil;
 static BOOL g_isPresentingMenu = NO;
+
 static int g_rotation = 90;
 static BOOL g_isSoundEnabled = YES;
 static BOOL g_isLoop = YES;
 
 static AudioStreamBasicDescription g_micASBD = {0};
 static BOOL g_hasProbedMicFormat = NO;
+
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
 static AVAssetReader *g_audioReader = nil;
@@ -30,7 +32,7 @@ static OSStatus (*orig_AudioUnitRender)(void *, AudioUnitRenderActionFlags *,
                                         UInt32, AudioBufferList *) = NULL;
 
 // ============================================================
-// 持久化工具
+// 持久化
 // ============================================================
 static void SaveSettings(void) {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
@@ -54,7 +56,7 @@ static NSString* GetDocumentPath(void) {
 }
 
 // ============================================================
-// 视频读取器设置
+// 视频读取器
 // ============================================================
 static void SetupVideoReader(NSString *filePath) {
     [g_mediaLock lock];
@@ -83,7 +85,7 @@ static void SetupVideoReader(NSString *filePath) {
 }
 
 // ============================================================
-// 音频读取器设置
+// 音频读取器
 // ============================================================
 static void SetupAudioReader(NSString *filePath) {
     [g_mediaLock lock];
@@ -293,21 +295,32 @@ static UIWindow* GetCurrentKeyWindow(void) {
 }
 
 // ============================================================
-// 自定义菜单（修复弃用API）
+// 自定义菜单（“确认”才生效，“取消”丢弃修改）
 // ============================================================
 @interface VCamMenuViewController : UIViewController
-@property (nonatomic, copy) void (^selectVideoHandler)(void);
-@property (nonatomic, copy) void (^rotateHandler)(void);
-@property (nonatomic, copy) void (^toggleSoundHandler)(void);
-@property (nonatomic, copy) void (^toggleLoopHandler)(void);
-@property (nonatomic, copy) void (^disableHandler)(void);
 @end
 
 @implementation VCamMenuViewController {
+    // 局部预览变量
+    int _tempRotation;
+    BOOL _tempSound;
+    BOOL _tempLoop;
+
     UIButton *_rotateBtn;
     UIButton *_soundBtn;
     UIButton *_loopBtn;
 }
+
+- (instancetype)init {
+    if (self = [super init]) {
+        // 从全局拷贝初始值
+        _tempRotation = g_rotation;
+        _tempSound = g_isSoundEnabled;
+        _tempLoop = g_isLoop;
+    }
+    return self;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];
@@ -341,19 +354,21 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [title.centerXAnchor constraintEqualToAnchor:navBar.centerXAnchor].active = YES;
     [title.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
 
+    // 取消按钮 → 丢弃所有修改并关闭
     UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [cancelBtn setTitle:@"取消" forState:UIControlStateNormal];
     cancelBtn.titleLabel.font = [UIFont systemFontOfSize:18];
-    [cancelBtn addTarget:self action:@selector(cancelTapped) forControlEvents:UIControlEventTouchUpInside];
+    [cancelBtn addTarget:self action:@selector(cancelAndDismiss) forControlEvents:UIControlEventTouchUpInside];
     cancelBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [navBar addSubview:cancelBtn];
     [cancelBtn.leadingAnchor constraintEqualToAnchor:navBar.leadingAnchor constant:16].active = YES;
     [cancelBtn.centerYAnchor constraintEqualToAnchor:navBar.centerYAnchor].active = YES;
 
+    // 确认按钮 → 应用修改并保存
     UIButton *confirmBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     [confirmBtn setTitle:@"确认" forState:UIControlStateNormal];
     confirmBtn.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
-    [confirmBtn addTarget:self action:@selector(confirmTapped) forControlEvents:UIControlEventTouchUpInside];
+    [confirmBtn addTarget:self action:@selector(confirmAndDismiss) forControlEvents:UIControlEventTouchUpInside];
     confirmBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [navBar addSubview:confirmBtn];
     [confirmBtn.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor constant:-16].active = YES;
@@ -370,10 +385,8 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [stack.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:16].active = YES;
     [stack.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-16].active = YES;
 
-    // 使用 UIButtonConfiguration 创建按钮（iOS 15+，无废弃警告）
     UIButton* (^createBtn)(NSString *title) = ^UIButton *(NSString *title) {
         UIButtonConfiguration *config = [UIButtonConfiguration filledButtonConfiguration];
-        config.title = title;
         config.baseBackgroundColor = [UIColor systemGray5Color];
         config.baseForegroundColor = [UIColor labelColor];
         config.contentInsets = NSDirectionalEdgeInsetsMake(12, 0, 12, 0);
@@ -386,20 +399,21 @@ static UIWindow* GetCurrentKeyWindow(void) {
         return btn;
     };
 
+    // 选择视频（仍然立即生效，因为需要触发热重载）
     UIButton *selectBtn = createBtn(@"选择视频");
     [selectBtn addTarget:self action:@selector(selectVideoTapped) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:selectBtn];
 
-    _rotateBtn = createBtn([NSString stringWithFormat:@"旋转画面 (%d°)", g_rotation]);
-    [_rotateBtn addTarget:self action:@selector(rotateTapped) forControlEvents:UIControlEventTouchUpInside];
+    _rotateBtn = createBtn([NSString stringWithFormat:@"旋转画面 (%d°)", _tempRotation]);
+    [_rotateBtn addTarget:self action:@selector(rotatePreview:) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:_rotateBtn];
 
-    _soundBtn = createBtn(g_isSoundEnabled ? @"声音：开启" : @"声音：关闭");
-    [_soundBtn addTarget:self action:@selector(soundTapped) forControlEvents:UIControlEventTouchUpInside];
+    _soundBtn = createBtn(_tempSound ? @"声音：开启" : @"声音：关闭");
+    [_soundBtn addTarget:self action:@selector(soundPreview:) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:_soundBtn];
 
-    _loopBtn = createBtn(g_isLoop ? @"循环播放：开启" : @"循环播放：关闭");
-    [_loopBtn addTarget:self action:@selector(loopTapped) forControlEvents:UIControlEventTouchUpInside];
+    _loopBtn = createBtn(_tempLoop ? @"循环播放：开启" : @"循环播放：关闭");
+    [_loopBtn addTarget:self action:@selector(loopPreview:) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:_loopBtn];
 
     UIButton *disableBtn = createBtn(@"禁用替换");
@@ -407,20 +421,89 @@ static UIWindow* GetCurrentKeyWindow(void) {
     [stack addArrangedSubview:disableBtn];
 }
 
-- (void)cancelTapped  { [self dismiss]; }
-- (void)confirmTapped { [self dismiss]; }
-- (void)dismiss {
+// 预览按钮：只改变局部变量和标题
+- (void)rotatePreview:(UIButton *)btn {
+    _tempRotation = (_tempRotation + 90) % 360;
+    [_rotateBtn setTitle:[NSString stringWithFormat:@"旋转画面 (%d°)", _tempRotation] forState:UIControlStateNormal];
+}
+
+- (void)soundPreview:(UIButton *)btn {
+    _tempSound = !_tempSound;
+    [_soundBtn setTitle:_tempSound ? @"声音：开启" : @"声音：关闭" forState:UIControlStateNormal];
+}
+
+- (void)loopPreview:(UIButton *)btn {
+    _tempLoop = !_tempLoop;
+    [_loopBtn setTitle:_tempLoop ? @"循环播放：开启" : @"循环播放：关闭" forState:UIControlStateNormal];
+}
+
+// 确认 → 应用修改并保存
+- (void)confirmAndDismiss {
+    g_rotation = _tempRotation;
+    g_isSoundEnabled = _tempSound;
+    g_isLoop = _tempLoop;
+    SaveSettings();
     [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
 }
-- (void)selectVideoTapped { if (self.selectVideoHandler) self.selectVideoHandler(); }
-- (void)rotateTapped      { if (self.rotateHandler)      self.rotateHandler();      [_rotateBtn setTitle:[NSString stringWithFormat:@"旋转画面 (%d°)", g_rotation] forState:UIControlStateNormal]; }
-- (void)soundTapped       { if (self.toggleSoundHandler) self.toggleSoundHandler(); [_soundBtn setTitle:g_isSoundEnabled ? @"声音：开启" : @"声音：关闭" forState:UIControlStateNormal]; }
-- (void)loopTapped        { if (self.toggleLoopHandler)  self.toggleLoopHandler();  [_loopBtn setTitle:g_isLoop ? @"循环播放：开启" : @"循环播放：关闭" forState:UIControlStateNormal]; }
-- (void)disableTapped     { if (self.disableHandler)     self.disableHandler(); }
+
+// 取消 → 什么也不改，直接关闭
+- (void)cancelAndDismiss {
+    [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
+}
+
+// 禁用替换（此功能仍立即生效）
+- (void)disableTapped {
+    // 直接操作全局，但不立刻关闭，等用户确认/取消
+    // 也可以立即生效并关闭，为方便起见保持原逻辑（立即生效）
+    if (g_fileManager && g_tempFile) {
+        if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
+        [g_mediaLock lock];
+        [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil;
+        [g_audioReader cancelReading]; g_audioReader = nil; g_audioOutput = nil;
+        [g_mediaLock unlock];
+    }
+    [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
+}
+
+// 选择视频按钮 → 保持不变，直接 present 相册
+- (void)selectVideoTapped {
+    // 复用原来的选择视频逻辑，但 present 在 self 上
+    static id pickerDelegate = nil;
+    if (!pickerDelegate) {
+        Class cls = objc_allocateClassPair([NSObject class], "VCamPDelegate", 0);
+        class_addProtocol(cls, @protocol(UIImagePickerControllerDelegate));
+        class_addProtocol(cls, @protocol(UINavigationControllerDelegate));
+        IMP imp = imp_implementationWithBlock(^(id self, UIImagePickerController *picker, NSDictionary *info) {
+            [picker dismissViewControllerAnimated:YES completion:nil];
+            NSURL *videoURL = info[UIImagePickerControllerMediaURL];
+            if (videoURL) {
+                NSString *src = videoURL.path;
+                if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
+                if ([g_fileManager copyItemAtPath:src toPath:g_tempFile error:nil]) {
+                    [@"1" writeToFile:[g_tempFile stringByAppendingString:@".new"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
+            }
+        });
+        class_addMethod(cls, @selector(imagePickerController:didFinishPickingMediaWithInfo:), imp, "v@:@@");
+        imp = imp_implementationWithBlock(^(id self, UIImagePickerController *picker) {
+            [picker dismissViewControllerAnimated:YES completion:nil];
+        });
+        class_addMethod(cls, @selector(imagePickerControllerDidCancel:), imp, "v@:@");
+        pickerDelegate = [cls new];
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+        picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+        picker.mediaTypes = @[@"public.movie"];
+        picker.delegate = pickerDelegate;
+        [self presentViewController:picker animated:YES completion:nil];
+    });
+}
+
 @end
 
 // ============================================================
-// 显示菜单
+// 显示菜单（不再需要回调，因为菜单内部自己处理）
 // ============================================================
 static void ShowVCamMenu(void) {
     if (g_isPresentingMenu) return;
@@ -432,57 +515,13 @@ static void ShowVCamMenu(void) {
     menuVC.modalPresentationStyle = UIModalPresentationOverFullScreen;
     menuVC.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
 
-    __weak VCamMenuViewController *weakMenu = menuVC;
-    menuVC.selectVideoHandler = ^{
-        dispatch_async(dispatch_get_main_queue(), ^{
-            static id pickerDelegate = nil;
-            if (!pickerDelegate) {
-                Class cls = objc_allocateClassPair([NSObject class], "VCamPDelegate", 0);
-                class_addProtocol(cls, @protocol(UIImagePickerControllerDelegate));
-                class_addProtocol(cls, @protocol(UINavigationControllerDelegate));
-                IMP imp = imp_implementationWithBlock(^(id self, UIImagePickerController *picker, NSDictionary *info) {
-                    [picker dismissViewControllerAnimated:YES completion:nil];
-                    NSURL *videoURL = info[UIImagePickerControllerMediaURL];
-                    if (videoURL) {
-                        NSString *src = videoURL.path;
-                        if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-                        if ([g_fileManager copyItemAtPath:src toPath:g_tempFile error:nil]) {
-                            [@"1" writeToFile:[g_tempFile stringByAppendingString:@".new"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                        }
-                    }
-                });
-                class_addMethod(cls, @selector(imagePickerController:didFinishPickingMediaWithInfo:), imp, "v@:@@");
-                imp = imp_implementationWithBlock(^(id self, UIImagePickerController *picker) {
-                    [picker dismissViewControllerAnimated:YES completion:nil];
-                });
-                class_addMethod(cls, @selector(imagePickerControllerDidCancel:), imp, "v@:@");
-                pickerDelegate = [cls new];
-            }
-            UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-            picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-            picker.mediaTypes = @[@"public.movie"];
-            picker.delegate = pickerDelegate;
-            [weakMenu presentViewController:picker animated:YES completion:nil];
-        });
-    };
-    menuVC.rotateHandler = ^{ g_rotation = (g_rotation + 90) % 360; SaveSettings(); };
-    menuVC.toggleSoundHandler = ^{ g_isSoundEnabled = !g_isSoundEnabled; SaveSettings(); };
-    menuVC.toggleLoopHandler  = ^{ g_isLoop = !g_isLoop; SaveSettings(); };
-    menuVC.disableHandler = ^{
-        if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-        [g_mediaLock lock];
-        [g_videoReader cancelReading]; g_videoReader = nil; g_videoOutput = nil;
-        [g_audioReader cancelReading]; g_audioReader = nil; g_audioOutput = nil;
-        [g_mediaLock unlock];
-    };
-
     UIViewController *rootVC = keyWindow.rootViewController;
     while (rootVC.presentedViewController) rootVC = rootVC.presentedViewController;
     [rootVC presentViewController:menuVC animated:YES completion:nil];
 }
 
 // ============================================================
-// 手势注入
+// 手势注入（不变）
 // ============================================================
 @interface UIWindow (VCam) - (void)vcam_handleTwoFingerDoubleTap:(UITapGestureRecognizer *)tap; @end
 @implementation UIWindow (VCam)
