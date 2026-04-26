@@ -21,9 +21,11 @@ static BOOL g_hasProbedMicFormat = NO;
 
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
-static AVAssetReader *g_audioReader = nil;
-static AVAssetReaderTrackOutput *g_audioOutput = nil;
 static NSLock *g_mediaLock = nil;
+
+// ✅ 原始文件：音频数据缓存
+static NSMutableData *g_audioCache = nil;
+static NSUInteger g_audioCacheOffset = 0;
 
 static OSStatus (*orig_AudioUnitRender)(
     void *,
@@ -55,7 +57,7 @@ static NSString* GetDocumentPath(void) {
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
 }
 
-#pragma mark - 视频读取器
+#pragma mark - 视频读取器（保持不变）
 
 static void SetupVideoReader(NSString *filePath) {
     [g_mediaLock lock];
@@ -89,103 +91,110 @@ static void SetupVideoReader(NSString *filePath) {
     [g_mediaLock unlock];
 }
 
-#pragma mark - 音频读取器
+#pragma mark - ✅ 原始文件：音频数据处理
 
-static void SetupAudioReader(NSString *filePath) {
+static void LoadAudioFromFile(NSString *filePath) {
     [g_mediaLock lock];
-    if (g_audioReader) {
-        [g_audioReader cancelReading];
-        g_audioReader = nil;
-        g_audioOutput = nil;
-    }
-    if (!g_hasProbedMicFormat || !filePath) {
+    g_audioCache = nil;
+    g_audioCacheOffset = 0;
+    
+    if (![g_fileManager fileExistsAtPath:filePath]) {
         [g_mediaLock unlock];
         return;
     }
+    
     AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:filePath]];
     NSArray *audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
     if (audioTracks.count == 0) {
         [g_mediaLock unlock];
         return;
     }
+    
     AVAssetTrack *track = audioTracks[0];
-
-    NSDictionary *settings = @{
-        AVFormatIDKey: @(kAudioFormatLinearPCM),
-        AVSampleRateKey: @(g_micASBD.mSampleRate),
-        AVNumberOfChannelsKey: @(g_micASBD.mChannelsPerFrame),
-        AVLinearPCMBitDepthKey: @(g_micASBD.mBitsPerChannel),
-        AVLinearPCMIsFloatKey: @((g_micASBD.mFormatFlags & kAudioFormatFlagIsFloat) != 0),
-        AVLinearPCMIsBigEndianKey: @((g_micASBD.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0),
-        AVLinearPCMIsNonInterleaved: @((g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0)
-    };
-
+    
+    // ✅ 原始文件：使用 AVAssetReader 读取整个音频文件到内存
     NSError *error = nil;
-    g_audioReader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
-    if (!g_audioReader || error) {
+    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&error];
+    if (error || !reader) {
         [g_mediaLock unlock];
         return;
     }
-    g_audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
-    [g_audioReader addOutput:g_audioOutput];
-    [g_audioReader startReading];
+    
+    NSDictionary *settings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVLinearPCMBitDepthKey: @16,
+        AVLinearPCMIsFloatKey: @NO,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleaved: @NO,
+        AVNumberOfChannelsKey: @2,
+        AVSampleRateKey: @44100.0
+    };
+    
+    AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+    [reader addOutput:output];
+    [reader startReading];
+    
+    NSMutableData *audioData = [NSMutableData data];
+    while (reader.status == AVAssetReaderStatusReading) {
+        CMSampleBufferRef sampleBuffer = [output copyNextSampleBuffer];
+        if (!sampleBuffer) break;
+        
+        CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+        size_t length = 0;
+        CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &length, NULL);
+        
+        if (length > 0) {
+            uint8_t *data = (uint8_t *)malloc(length);
+            CMBlockBufferCopyDataBytes(blockBuffer, 0, length, data);
+            [audioData appendBytes:data length:length];
+            free(data);
+        }
+        CFRelease(sampleBuffer);
+    }
+    
+    if (reader.status == AVAssetReaderStatusCompleted) {
+        g_audioCache = audioData;
+    }
+    
     [g_mediaLock unlock];
 }
 
-static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
+static NSData* GetAudioData(NSUInteger needBytes) {
     [g_mediaLock lock];
-    CMSampleBufferRef sample = [g_videoOutput copyNextSampleBuffer];
-    if (!sample && g_isLoop && g_tempFile) {
+    
+    if (!g_audioCache || g_audioCache.length == 0) {
         [g_mediaLock unlock];
-        SetupVideoReader(g_tempFile);
-        [g_mediaLock lock];
-        sample = [g_videoOutput copyNextSampleBuffer];
+        return [NSMutableData dataWithLength:needBytes];
     }
-    CVPixelBufferRef pixel = NULL;
-    if (sample) {
-        pixel = CMSampleBufferGetImageBuffer(sample);
-        if (pixel) CVPixelBufferRetain(pixel);
-        CFRelease(sample);
-    }
-    [g_mediaLock unlock];
-    return pixel;
-}
-
-static NSData* PullAudioData(UInt32 needBytes) {
-    NSMutableData *data = [NSMutableData data];
-    [g_mediaLock lock];
+    
+    NSMutableData *data = [NSMutableData dataWithCapacity:needBytes];
+    
     while (data.length < needBytes) {
-        if (!g_audioReader || g_audioReader.status != AVAssetReaderStatusReading) {
-            if (g_isLoop && g_tempFile) {
-                [g_mediaLock unlock];
-                SetupAudioReader(g_tempFile);
-                [g_mediaLock lock];
-                continue;
+        if (g_audioCacheOffset >= g_audioCache.length) {
+            if (g_isLoop) {
+                g_audioCacheOffset = 0;
+            } else {
+                break;
             }
-            break;
         }
-        CMSampleBufferRef sample = [g_audioOutput copyNextSampleBuffer];
-        if (!sample) break;
-        CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
-        size_t totalSize = 0;
-        CMBlockBufferGetDataPointer(block, 0, NULL, &totalSize, NULL);
-        if (totalSize > 0) {
-            // ✅ 修复：强制类型转换
-            uint8_t *ptr = (uint8_t *)malloc(totalSize);
-            CMBlockBufferCopyDataBytes(block, 0, totalSize, ptr);
-            [data appendBytes:ptr length:totalSize];
-            free(ptr);
-        }
-        CFRelease(sample);
+        
+        NSUInteger remaining = needBytes - data.length;
+        NSUInteger available = g_audioCache.length - g_audioCacheOffset;
+        NSUInteger copyLen = MIN(remaining, available);
+        
+        [data appendBytes:((uint8_t *)g_audioCache.bytes + g_audioCacheOffset) length:copyLen];
+        g_audioCacheOffset += copyLen;
     }
-    [g_mediaLock unlock];
+    
     if (data.length < needBytes) {
         [data increaseLengthBy:needBytes - data.length];
     }
+    
+    [g_mediaLock unlock];
     return data;
 }
 
-#pragma mark - 视频绘制
+#pragma mark - 视频绘制（保持不变）
 
 static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     if (!g_fileManager || !g_tempFile || ![g_fileManager fileExistsAtPath:g_tempFile]) return;
@@ -196,7 +205,7 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
         lastLoad = now;
         [g_fileManager removeItemAtPath:newMark error:nil];
         SetupVideoReader(g_tempFile);
-        SetupAudioReader(g_tempFile);
+        LoadAudioFromFile(g_tempFile);
     }
     CVPixelBufferRef src = GetNextVideoPixelBuffer();
     if (!src) return;
@@ -237,7 +246,26 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     CVPixelBufferUnlockBaseAddress(targetBuffer, 0);
 }
 
-#pragma mark - AudioUnitRender（对齐原始 VCAM）
+static CVPixelBufferRef GetNextVideoPixelBuffer(void) {
+    [g_mediaLock lock];
+    CMSampleBufferRef sample = [g_videoOutput copyNextSampleBuffer];
+    if (!sample && g_isLoop && g_tempFile) {
+        [g_mediaLock unlock];
+        SetupVideoReader(g_tempFile);
+        [g_mediaLock lock];
+        sample = [g_videoOutput copyNextSampleBuffer];
+    }
+    CVPixelBufferRef pixel = NULL;
+    if (sample) {
+        pixel = CMSampleBufferGetImageBuffer(sample);
+        if (pixel) CVPixelBufferRetain(pixel);
+        CFRelease(sample);
+    }
+    [g_mediaLock unlock];
+    return pixel;
+}
+
+#pragma mark - ✅ 原始文件：AudioUnitRender Hook
 
 static OSStatus hooked_AudioUnitRender(
     void *inRefCon,
@@ -251,6 +279,7 @@ static OSStatus hooked_AudioUnitRender(
         return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     }
 
+    // ✅ 原始文件：探测麦克风格式
     if (!g_hasProbedMicFormat) {
         AudioUnit au = (AudioUnit)inRefCon;
         UInt32 size = sizeof(g_micASBD);
@@ -261,7 +290,7 @@ static OSStatus hooked_AudioUnitRender(
                                  &g_micASBD,
                                  &size) == noErr) {
             g_hasProbedMicFormat = YES;
-            if (g_tempFile) SetupAudioReader(g_tempFile);
+            if (g_tempFile) LoadAudioFromFile(g_tempFile);
         } else {
             memset(&g_micASBD, 0, sizeof(g_micASBD));
             g_micASBD.mSampleRate = 44100.0;
@@ -273,37 +302,50 @@ static OSStatus hooked_AudioUnitRender(
             g_micASBD.mChannelsPerFrame = 2;
             g_micASBD.mBitsPerChannel = 16;
             g_hasProbedMicFormat = YES;
-            if (g_tempFile) SetupAudioReader(g_tempFile);
+            if (g_tempFile) LoadAudioFromFile(g_tempFile);
         }
     }
 
-    if (!g_isSoundEnabled || !g_audioReader) {
-        return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
-    }
+    // ✅ 原始文件：总是调用原始函数
+    OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    if (ret != noErr) return ret;
 
-    UInt32 bytesPerFrame = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
-    UInt32 need = inNumberFrames * bytesPerFrame;
-
-    NSData *d = PullAudioData(need);
-    BOOL ni = (g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
-
-    if (ni) {
-        UInt32 per = need / ioData->mNumberBuffers;
-        for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
-            memcpy(ioData->mBuffers[i].mData, (uint8_t *)d.bytes + i * per, per);
+    // ✅ 原始文件：如果启用声音，替换音频数据
+    if (g_isSoundEnabled && g_audioCache) {
+        UInt32 bytesPerFrame = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
+        UInt32 need = inNumberFrames * bytesPerFrame;
+        
+        if (need > 0 && ioData->mNumberBuffers > 0) {
+            NSData *audioData = GetAudioData(need);
+            if (audioData.length >= need) {
+                BOOL nonInterleaved = (g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+                
+                if (nonInterleaved) {
+                    UInt32 bytesPerChannel = need / ioData->mNumberBuffers;
+                    for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
+                        AudioBuffer *buf = &ioData->mBuffers[i];
+                        if (buf->mData && buf->mDataByteSize >= bytesPerChannel) {
+                            memcpy(buf->mData, (uint8_t *)audioData.bytes + i * bytesPerChannel, bytesPerChannel);
+                        }
+                    }
+                } else {
+                    AudioBuffer *buf = &ioData->mBuffers[0];
+                    if (buf->mData && buf->mDataByteSize >= need) {
+                        memcpy(buf->mData, audioData.bytes, need);
+                    }
+                }
+            }
         }
-    } else {
-        memcpy(ioData->mBuffers[0].mData, d.bytes, need);
     }
 
-    return noErr;
+    return ret;
 }
 
 static void InstallAudioHook(void) {
     MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&orig_AudioUnitRender);
 }
 
-#pragma mark - 视频代理
+#pragma mark - 视频代理（保持不变）
 
 @interface VCamVideoProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)setOriginalDelegate:(id)delegate queue:(dispatch_queue_t)queue;
@@ -342,7 +384,7 @@ static VCamVideoProxy *g_videoProxy = nil;
 }
 %end
 
-#pragma mark - 悬浮菜单（原样保留）
+#pragma mark - 悬浮菜单（保持不变）
 
 static UIWindow* GetCurrentKeyWindow(void) {
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -557,9 +599,10 @@ static UIWindow* GetCurrentKeyWindow(void) {
     if ([g_fileManager fileExistsAtPath:g_tempFile])
         [g_fileManager removeItemAtPath:g_tempFile error:nil];
     [g_mediaLock lock];
-    [g_videoReader cancelReading];
-    [g_audioReader cancelReading];
-    g_videoReader = g_audioReader = nil;
+    if (g_videoReader) [g_videoReader cancelReading];
+    g_videoReader = nil;
+    g_audioCache = nil;
+    g_audioCacheOffset = 0;
     [g_mediaLock unlock];
     [self dismissViewControllerAnimated:YES completion:^{ g_isPresentingMenu = NO; }];
 }
@@ -621,14 +664,15 @@ static void AddGestureToWindow(UIWindow *win) {
     g_tempFile = [[GetDocumentPath() stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
     if ([g_fileManager fileExistsAtPath:g_tempFile]) {
         SetupVideoReader(g_tempFile);
+        LoadAudioFromFile(g_tempFile);
     }
     InstallAudioHook();
 }
 
 %dtor {
     [g_mediaLock lock];
-    [g_videoReader cancelReading];
-    [g_audioReader cancelReading];
-    g_videoReader = g_audioReader = nil;
+    if (g_videoReader) [g_videoReader cancelReading];
+    g_videoReader = nil;
+    g_audioCache = nil;
     [g_mediaLock unlock];
 }
