@@ -16,18 +16,15 @@ static int g_rotation = 90;
 static BOOL g_isSoundEnabled = YES;
 static BOOL g_isLoop = YES;
 
-// 音频格式记录
 static AudioStreamBasicDescription g_micASBD = {0};
 static BOOL g_hasProbedMicFormat = NO;
 
-// 视频/音频读取器
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
 static AVAssetReader *g_audioReader = nil;
 static AVAssetReaderTrackOutput *g_audioOutput = nil;
 static NSLock *g_mediaLock = nil;
 
-// 原始 AudioUnitRender 指针
 static OSStatus (*orig_AudioUnitRender)(void *, AudioUnitRenderActionFlags *, const AudioTimeStamp *, UInt32, UInt32, AudioBufferList *) = NULL;
 
 #pragma mark - 辅助函数
@@ -81,11 +78,14 @@ static void SetupVideoReader(NSString *filePath) {
     g_videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack outputSettings:settings];
     g_videoOutput.alwaysCopiesSampleData = NO;
     [g_videoReader addOutput:g_videoOutput];
-    [g_videoReader startReading];
+    if ([g_videoReader startReading] != AVAssetReaderStatusReading) {
+        g_videoReader = nil;
+        g_videoOutput = nil;
+    }
     [g_mediaLock unlock];
 }
 
-#pragma mark - 音频读取器（严格使用探测到的麦克风格式）
+#pragma mark - 音频读取器（严格匹配探测到的麦克风格式）
 
 static void SetupAudioReader(NSString *filePath) {
     [g_mediaLock lock];
@@ -120,7 +120,7 @@ static void SetupAudioReader(NSString *filePath) {
     g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:&error];
     if (g_audioReader && !error) {
         [g_audioReader addOutput:g_audioOutput];
-        if (![g_audioReader startReading]) {
+        if ([g_audioReader startReading] != AVAssetReaderStatusReading) {
             g_audioReader = nil;
             g_audioOutput = nil;
         }
@@ -168,13 +168,17 @@ static NSData* PullAudioData(NSUInteger needBytes) {
                 continue;
             } else break;
         }
-        size_t totalSize = CMSampleBufferGetTotalSampleSize(sample);
+        CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
+        size_t totalSize = 0;
+        if (block) {
+            // 获取音频数据真实长度
+            CMBlockBufferGetDataPointer(block, 0, NULL, &totalSize, NULL);
+        }
         if (totalSize > 0) {
             NSUInteger remaining = needBytes - data.length;
             NSUInteger copyLen = MIN(totalSize, remaining);
             void *ptr = malloc(copyLen);
             if (ptr) {
-                CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
                 if (CMBlockBufferCopyDataBytes(block, 0, copyLen, ptr) == kCMBlockBufferNoErr) {
                     [data appendBytes:ptr length:copyLen];
                 }
@@ -184,7 +188,7 @@ static NSData* PullAudioData(NSUInteger needBytes) {
         CFRelease(sample);
     }
     [g_mediaLock unlock];
-    // 不足时补零（静音）
+    // 不足时补静音
     if (data.length < needBytes) {
         NSMutableData *padded = [NSMutableData dataWithData:data];
         [padded increaseLengthBy:needBytes - data.length];
@@ -233,7 +237,9 @@ static void DrawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     CIImage *final = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation((targetWidth - scaledExtent.size.width)/2.0, (targetHeight - scaledExtent.size.height)/2.0)];
     static CIContext *ctx = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ ctx = [CIContext contextWithOptions:@{kCIContextWorkingColorSpace: (__bridge id)CGColorSpaceCreateDeviceRGB()}]; });
+    dispatch_once(&once, ^{
+        ctx = [CIContext contextWithOptions:@{kCIContextWorkingColorSpace: (__bridge id)CGColorSpaceCreateDeviceRGB()}];
+    });
     CVPixelBufferLockBaseAddress(targetBuffer, 0);
     [ctx render:final toCVPixelBuffer:targetBuffer];
     CVPixelBufferUnlockBaseAddress(targetBuffer, 0);
@@ -272,15 +278,20 @@ static VCamVideoProxy *g_videoProxy = nil;
 
 #pragma mark - 音频处理（核心：AudioUnitRender Hook）
 
-// 音频格式探测 + 数据替换
 static OSStatus hooked_AudioUnitRender(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags,
                                         const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber,
                                         UInt32 inNumberFrames, AudioBufferList *ioData) {
-    // 第一次调用时探测麦克风实际格式
+    // 只处理麦克风输入总线 (RemoteIO 的 Bus 1)
+    if (inBusNumber != 1) {
+        return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    }
+
+    // 第一次调用时探测麦克风实际格式（使用 Output Scope）
     if (!g_hasProbedMicFormat) {
         AudioUnit au = (AudioUnit)inRefCon;
         UInt32 size = sizeof(g_micASBD);
-        if (AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, inBusNumber, &g_micASBD, &size) == noErr) {
+        if (AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat,
+                                 kAudioUnitScope_Output, 1, &g_micASBD, &size) == noErr) {
             g_hasProbedMicFormat = YES;
             if (g_tempFile && [g_fileManager fileExistsAtPath:g_tempFile]) {
                 SetupAudioReader(g_tempFile);
@@ -291,7 +302,7 @@ static OSStatus hooked_AudioUnitRender(void *inRefCon, AudioUnitRenderActionFlag
             g_micASBD.mSampleRate = 44100.0;
             g_micASBD.mFormatID = kAudioFormatLinearPCM;
             g_micASBD.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
-            g_micASBD.mBytesPerPacket = 4;      // 2 channels * 2 bytes
+            g_micASBD.mBytesPerPacket = 4;
             g_micASBD.mFramesPerPacket = 1;
             g_micASBD.mBytesPerFrame = 4;
             g_micASBD.mChannelsPerFrame = 2;
@@ -303,20 +314,21 @@ static OSStatus hooked_AudioUnitRender(void *inRefCon, AudioUnitRenderActionFlag
         }
     }
 
+    // 调用原始 AudioUnitRender 填充 ioData（麦克风真实数据）
     OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (ret != noErr) return ret;
 
-    // 替换音频数据
+    // 替换音频数据（当声音开关开启且音频读取器可用时）
     if (g_isSoundEnabled && g_audioReader && g_audioReader.status == AVAssetReaderStatusReading) {
         UInt32 needBytes = inNumberFrames * g_micASBD.mBytesPerFrame;
-        if (needBytes > 0) {
+        if (needBytes > 0 && ioData->mNumberBuffers > 0) {
             NSData *replacement = PullAudioData(needBytes);
             if (replacement.length >= needBytes) {
-                const void *srcBytes = replacement.bytes;
+                const void *src = replacement.bytes;
                 for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
                     AudioBuffer *buf = &ioData->mBuffers[i];
                     if (buf->mData && buf->mDataByteSize >= needBytes) {
-                        memcpy(buf->mData, srcBytes, needBytes);
+                        memcpy(buf->mData, src, needBytes);
                     }
                 }
             }
