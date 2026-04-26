@@ -8,6 +8,7 @@
 #import <objc/message.h>
 #import <substrate.h>
 
+// ==================== 全局状态 ====================
 static NSFileManager *g_fileManager = nil;
 static NSString *g_tempFile = nil;
 static BOOL g_isPresentingMenu = NO;
@@ -27,6 +28,7 @@ static NSUInteger g_audioOffset = 0;
 
 static NSLock *g_lock = nil;
 
+// ==================== Hook 函数指针 ====================
 static OSStatus (*orig_AudioUnitRender)(
     void *,
     AudioUnitRenderActionFlags *,
@@ -36,7 +38,15 @@ static OSStatus (*orig_AudioUnitRender)(
     AudioBufferList *
 ) = NULL;
 
-#pragma mark - 设置
+static OSStatus (*orig_AudioUnitProcess)(
+    AudioUnit,
+    AudioUnitRenderActionFlags *,
+    const AudioTimeStamp *,
+    UInt32,
+    AudioBufferList *
+) = NULL;
+
+#pragma mark - 设置存储
 
 static void SaveSettings(void) {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
@@ -49,8 +59,8 @@ static void SaveSettings(void) {
 static void LoadSettings(void) {
     NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
     if ([defs objectForKey:@"vcam_rotation"]) g_rotation = (int)[defs integerForKey:@"vcam_rotation"];
-    if ([defs objectForKey:@"vcam_sound"])   g_isSoundEnabled = [defs boolForKey:@"vcam_sound"];
-    if ([defs objectForKey:@"vcam_loop"])    g_isLoop = [defs boolForKey:@"vcam_loop"];
+    if ([defs objectForKey:@"vcam_sound"]) g_isSoundEnabled = [defs boolForKey:@"vcam_sound"];
+    if ([defs objectForKey:@"vcam_loop"]) g_isLoop = [defs boolForKey:@"vcam_loop"];
 }
 
 static NSString* DocPath(void) {
@@ -107,7 +117,16 @@ static CVPixelBufferRef ReadVideoFrame(void) {
     return p;
 }
 
-#pragma mark - ✅ 原始 VCAM 音频处理
+#pragma mark - 音频处理（✅ 微信专用：先静音再替换）
+
+static void SilenceBufferList(AudioBufferList *list) {
+    if (!list) return;
+    for (UInt32 i = 0; i < list->mNumberBuffers; i++) {
+        if (list->mBuffers[i].mData) {
+            memset(list->mBuffers[i].mData, 0, list->mBuffers[i].mDataByteSize);
+        }
+    }
+}
 
 static void LoadAudio(NSString *path, AudioStreamBasicDescription asbd) {
     [g_lock lock];
@@ -160,6 +179,7 @@ static void LoadAudio(NSString *path, AudioStreamBasicDescription asbd) {
 
     if (r.status == AVAssetReaderStatusCompleted) {
         g_audioCache = data;
+        NSLog(@"[VCAM] Audio loaded: %lu bytes", (unsigned long)data.length);
     }
 
     [g_lock unlock];
@@ -193,31 +213,28 @@ static NSData *ReadAudio(UInt32 need) {
     return d;
 }
 
-#pragma mark - AudioUnitRender（✅ 原始 VCAM 行为）
+#pragma mark - ✅ Hook: AudioUnitRender (微信语音核心)
 
 static OSStatus hooked_AudioUnitRender(
-    void *inRefCon,
-    AudioUnitRenderActionFlags *ioActionFlags,
-    const AudioTimeStamp *inTimeStamp,
-    UInt32 inBusNumber,
-    UInt32 inNumberFrames,
-    AudioBufferList *ioData
+    void *rc,
+    AudioUnitRenderActionFlags *f,
+    const AudioTimeStamp *ts,
+    UInt32 bus,
+    UInt32 frames,
+    AudioBufferList *io
 ) {
-    if (inBusNumber != 0 && inBusNumber != 1) {
-        return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    // 微信语音通话使用 Bus 1 作为麦克风输入
+    if (bus != 1) {
+        return orig_AudioUnitRender(rc, f, ts, bus, frames, io);
     }
 
-    // ✅ 探测格式
+    // 探测格式
     if (!g_hasProbedMicFormat) {
-        AudioUnit au = (AudioUnit)inRefCon;
+        AudioUnit au = (AudioUnit)rc;
         UInt32 sz = sizeof(g_micASBD);
-        if (AudioUnitGetProperty(au,
-                                 kAudioUnitProperty_StreamFormat,
-                                 kAudioUnitScope_Input,
-                                 inBusNumber,
-                                 &g_micASBD,
-                                 &sz) == noErr) {
+        if (AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, bus, &g_micASBD, &sz) == noErr) {
             g_hasProbedMicFormat = YES;
+            NSLog(@"[VCAM] Format probed: %.0f Hz", g_micASBD.mSampleRate);
             if (g_tempFile) LoadAudio(g_tempFile, g_micASBD);
         } else {
             memset(&g_micASBD, 0, sizeof(g_micASBD));
@@ -234,35 +251,78 @@ static OSStatus hooked_AudioUnitRender(
         }
     }
 
-    // ✅ 先让系统正常渲染（必须）
-    OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    // 先调用原始函数（获取真实麦克风数据）
+    OSStatus ret = orig_AudioUnitRender(rc, f, ts, bus, frames, io);
     if (ret != noErr) return ret;
 
     if (!g_isSoundEnabled || !g_audioCache) return ret;
 
-    UInt32 bytesPerFrame = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
-    UInt32 need = inNumberFrames * bytesPerFrame;
+    UInt32 bpf = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
+    if (bpf == 0) return ret;
+    UInt32 need = frames * bpf;
 
     NSData *d = ReadAudio(need);
     if (d.length < need) return ret;
 
-    // ✅✅✅ 原始 VCAM 的唯一正确做法：直接改指针
-    BOOL ni = (g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+    // ✅ 关键：先清空真实声音，再写入假声音
+    SilenceBufferList(io);
 
+    BOOL ni = (g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
     if (ni) {
-        UInt32 per = need / ioData->mNumberBuffers;
-        for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
-            ioData->mBuffers[i].mData = (void *)((uint8_t *)d.bytes + i * per);
-            ioData->mBuffers[i].mDataByteSize = per;
+        UInt32 per = need / io->mNumberBuffers;
+        for (UInt32 i = 0; i < io->mNumberBuffers; i++) {
+            if (io->mBuffers[i].mData) {
+                memcpy(io->mBuffers[i].mData, (uint8_t *)d.bytes + i * per, per);
+            }
         }
     } else {
-        ioData->mBuffers[0].mData = (void *)d.bytes;
-        ioData->mBuffers[0].mDataByteSize = need;
+        if (io->mBuffers[0].mData) {
+            memcpy(io->mBuffers[0].mData, d.bytes, need);
+        }
     }
 
     return ret;
 }
 
+#pragma mark - ✅ Hook: AudioUnitProcess (补充防线)
+
+static OSStatus hooked_AudioUnitProcess(
+    AudioUnit unit,
+    AudioUnitRenderActionFlags *ioActionFlags,
+    const AudioTimeStamp *inTimeStamp,
+    UInt32 inNumberFrames,
+    AudioBufferList *ioData
+) {
+    OSStatus ret = orig_AudioUnitProcess(unit, ioActionFlags, inTimeStamp, inNumberFrames, ioData);
+    if (ret != noErr) return ret;
+
+    if (!g_isSoundEnabled || !g_audioCache || !g_hasProbedMicFormat) return ret;
+
+    UInt32 bpf = g_micASBD.mBytesPerFrame ?: g_micASBD.mChannelsPerFrame * (g_micASBD.mBitsPerChannel / 8);
+    if (bpf == 0) return ret;
+    UInt32 need = inNumberFrames * bpf;
+
+    NSData *d = ReadAudio(need);
+    if (d.length < need) return ret;
+
+    SilenceBufferList(ioData);
+
+    BOOL ni = (g_micASBD.mFormatFlags & kAudioFormatFlagIsNonInterleaved);
+    if (ni) {
+        UInt32 per = need / ioData->mNumberBuffers;
+        for (UInt32 i = 0; i < ioData->mNumberBuffers; i++) {
+            if (ioData->mBuffers[i].mData) {
+                memcpy(ioData->mBuffers[i].mData, (uint8_t *)d.bytes + i * per, per);
+            }
+        }
+    } else {
+        if (ioData->mBuffers[0].mData) {
+            memcpy(ioData->mBuffers[0].mData, d.bytes, need);
+        }
+    }
+
+    return ret;
+}
 
 #pragma mark - 视频代理
 
@@ -349,7 +409,7 @@ static VCamVideoProxy *g_proxy = nil;
 }
 %end
 
-#pragma mark - 菜单（✅ 原样保留）
+#pragma mark - 悬浮菜单
 
 static UIWindow* GetKeyWindow(void) {
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
@@ -622,7 +682,7 @@ static void AddGestureToWindow(UIWindow *win) {
 }
 %end
 
-#pragma mark - 构造
+#pragma mark - 构造器
 
 %ctor {
     g_fileManager = NSFileManager.defaultManager;
@@ -632,9 +692,23 @@ static void AddGestureToWindow(UIWindow *win) {
 
     if ([g_fileManager fileExistsAtPath:g_tempFile]) {
         SetupVideo(g_tempFile);
+        // 预加载音频
+        memset(&g_micASBD, 0, sizeof(g_micASBD));
+        g_micASBD.mSampleRate = 44100;
+        g_micASBD.mFormatID = kAudioFormatLinearPCM;
+        g_micASBD.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
+        g_micASBD.mBytesPerPacket = 4;
+        g_micASBD.mFramesPerPacket = 1;
+        g_micASBD.mBytesPerFrame = 4;
+        g_micASBD.mChannelsPerFrame = 2;
+        g_micASBD.mBitsPerChannel = 16;
+        g_hasProbedMicFormat = YES;
+        LoadAudio(g_tempFile, g_micASBD);
     }
 
-    MSHookFunction((void *)AudioUnitRender,
-                   (void *)hooked_AudioUnitRender,
-                   (void **)&orig_AudioUnitRender);
+    // 安装 Hook
+    MSHookFunction((void *)AudioUnitRender, (void *)hooked_AudioUnitRender, (void **)&orig_AudioUnitRender);
+    MSHookFunction((void *)AudioUnitProcess, (void *)hooked_AudioUnitProcess, (void **)&orig_AudioUnitProcess);
+
+    NSLog(@"[VCAM] Initialized for WeChat.");
 }
