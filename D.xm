@@ -16,8 +16,16 @@ static int g_rotation = 90;
 static BOOL g_isSoundEnabled = YES;
 static BOOL g_isLoop = YES;
 
-static AudioStreamBasicDescription g_micASBD = {0};
-static BOOL g_hasProbedMicFormat = NO;
+static AudioStreamBasicDescription g_micASBD = {
+    .mSampleRate = 44100.0,
+    .mFormatID = kAudioFormatLinearPCM,
+    .mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+    .mBitsPerChannel = 16,
+    .mChannelsPerFrame = 1,
+    .mBytesPerFrame = 2,
+    .mBytesPerPacket = 2,
+    .mFramesPerPacket = 1
+};
 
 static AVAssetReader *g_videoReader = nil;
 static AVAssetReaderTrackOutput *g_videoOutput = nil;
@@ -74,7 +82,6 @@ static void SetupVideoReader(NSString *filePath) {
     [g_mediaLock unlock];
 }
 
-// 修正：移除 AVLinearPCMIsNonInterleaved
 static void SetupAudioReader(NSString *filePath) {
     [g_mediaLock lock];
     if (g_audioReader) {
@@ -82,22 +89,17 @@ static void SetupAudioReader(NSString *filePath) {
         g_audioReader = nil;
         g_audioOutput = nil;
     }
-    if (!g_hasProbedMicFormat) {
-        [g_mediaLock unlock];
-        return;
-    }
     AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:filePath]];
     NSArray *audioTracks = [asset tracksWithMediaType:AVMediaTypeAudio];
     if (audioTracks.count == 0) { [g_mediaLock unlock]; return; }
     AVAssetTrack *track = audioTracks[0];
-    AudioStreamBasicDescription asbd = g_micASBD;
     NSDictionary *settings = @{
         AVFormatIDKey            : @(kAudioFormatLinearPCM),
-        AVLinearPCMBitDepthKey   : @(asbd.mBitsPerChannel),
-        AVLinearPCMIsFloatKey    : @((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0),
-        AVLinearPCMIsBigEndianKey: @((asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0),
-        AVNumberOfChannelsKey    : @(asbd.mChannelsPerFrame),
-        AVSampleRateKey          : @(asbd.mSampleRate)
+        AVLinearPCMBitDepthKey   : @(g_micASBD.mBitsPerChannel),
+        AVLinearPCMIsFloatKey    : @((g_micASBD.mFormatFlags & kAudioFormatFlagIsFloat) != 0),
+        AVLinearPCMIsBigEndianKey: @((g_micASBD.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0),
+        AVNumberOfChannelsKey    : @(g_micASBD.mChannelsPerFrame),
+        AVSampleRateKey          : @(g_micASBD.mSampleRate)
     };
     g_audioOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
     g_audioReader = [AVAssetReader assetReaderWithAsset:asset error:nil];
@@ -246,25 +248,23 @@ static VCamProxy *g_proxy = nil;
 }
 %end
 
-// 修正：先尝试 element 1，失败则尝试 element 0
+// 关键修复：使用 dispatch_once 初始化音频读取器，不再探测格式
 static OSStatus hooked_AudioUnitRender(void *inRefCon,
                                        AudioUnitRenderActionFlags *ioActionFlags,
                                        const AudioTimeStamp *inTimeStamp,
                                        UInt32 inBusNumber,
                                        UInt32 inNumberFrames,
                                        AudioBufferList *ioData) {
-    if (!g_hasProbedMicFormat) {
-        AudioUnit au = (AudioUnit)inRefCon;
-        UInt32 size = sizeof(g_micASBD);
-        if (AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &g_micASBD, &size) != noErr &&
-            AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &g_micASBD, &size) != noErr) {
-            return orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        if (g_tempFile && [g_fileManager fileExistsAtPath:g_tempFile]) {
+            SetupAudioReader(g_tempFile);
         }
-        g_hasProbedMicFormat = YES;
-        if (g_tempFile && [g_fileManager fileExistsAtPath:g_tempFile]) SetupAudioReader(g_tempFile);
-    }
+    });
+
     OSStatus ret = orig_AudioUnitRender(inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData);
     if (!g_isSoundEnabled || !ioData || ioData->mNumberBuffers == 0) return ret;
+
     AudioBuffer *buf = &ioData->mBuffers[0];
     NSUInteger sampleSize = g_micASBD.mBitsPerChannel / 8;
     NSUInteger channels = g_micASBD.mChannelsPerFrame;
@@ -517,7 +517,10 @@ static void AddGestureToWindow(UIWindow *window) {
     g_mediaLock = [[NSLock alloc] init];
     LoadSettings();
     g_tempFile = [[GetDocumentPath() stringByAppendingPathComponent:@"bear_vcam_temp.mov"] copy];
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) SetupVideoReader(g_tempFile);
+    if ([g_fileManager fileExistsAtPath:g_tempFile]) {
+        SetupVideoReader(g_tempFile);
+        // 音频读取器将在第一次 AudioUnitRender 时初始化
+    }
     InstallAudioHook();
 }
 
